@@ -1,0 +1,21 @@
+deltachat-core for Debian
+-------------------------
+
+The packaging is kept in: https://salsa.debian.org/debian/deltachat-core
+
+The upstream branch contains a repacked source tree, see debian/copyright for
+a list of files that were removed and the reasons for that.
+
+The master branch contains the latest state of the debian package.
+
+The pristine-tar branch contains information for reconstructing repacked
+upstream sources.
+
+It should be possible to build the package with git-buildpackage:
+
+  sudo apt install git-buildpackage pristine-tar
+  git clone https://salsa.debian.org/debian/deltacha-core
+  gbp buildpackage
+
+ -- Andre Bianchi <drebs@riseup.net>  Sun, 23 Sep 2018 10:00:51 -0400
+

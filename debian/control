@@ -1,0 +1,39 @@
+Source: deltachat-core
+Priority: optional
+Maintainer: Micah Anderson <micah@debian.org>
+Build-Depends: debhelper-compat (= 12), meson, pkg-config, libetpan-dev, libssl-dev, libsqlite3-dev, libsasl2-dev, libbz2-dev, zlib1g-dev, ninja-build, git, doxygen
+Standards-Version: 4.5.0
+Section: libs
+Homepage: https://delta.chat/
+Rules-Requires-Root: no
+Vcs-Git: https://salsa.debian.org/debian/deltachat-core.git
+Vcs-Browser: https://salsa.debian.org/debian/deltachat-core
+
+Package: libdeltachat0-dev
+Section: libdevel
+Architecture: any
+Multi-Arch: same
+Depends: libdeltachat0 (= ${binary:Version}), ${misc:Depends}
+Description: Delta.Chat development files
+ Delta Chat is a modern messenger. It is like email in a new dress.
+ Just better, safer and user-optimised. This package provides the
+ Delta Chat development files.
+
+Package: libdeltachat0
+Architecture: any
+Multi-Arch: same
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Delta.Chat shared libraries
+ Delta Chat is a modern messenger. It is like email in a new dress.
+ Just better, safer and user-optimised. This package provides the
+ Delta Chat shared libraries.
+
+Package: libdeltachat0-doc
+Section: doc
+Architecture: all
+Multi-Arch: foreign
+Depends: ${shlibs:Depends}, ${misc:Depends}, libjs-jquery
+Description: Delta.Chat API documentation
+ Delta Chat is a modern messenger. It is like email in a new dress.
+ Just better, safer and user-optimised. This package provides the
+ Delta Chat API documentation.
