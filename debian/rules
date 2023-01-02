@@ -1,9 +1,9 @@
 #!/usr/bin/make -f
 
-override_dh_auto_build-indep:
-	(cd docs && doxygen)
-	rm docs/html/jquery.js
-	ln -sf /usr/share/javascript/jquery/jquery.js docs/html/jquery.js
+#override_dh_auto_build-indep:
+#	(cd docs && doxygen)
+#	rm docs/html/jquery.js
+#	ln -sf /usr/share/javascript/jquery/jquery.js docs/html/jquery.js
 
 %:
-	dh $@
+	dh $@ --buildsystem=cmake

@@ -1,41 +1,5 @@
-deltachat-core (0.45.0+ds-1) unstable; urgency=medium
+deltachat-core-rust (1.104.0-1) unstable; urgency=medium
 
-  * Team upload.
-  * New upstream version
-    Closes: #952619
-  * Standards-Version: 4.5.0 (routine-update)
-  * debhelper-compat 12 (routine-update)
-  * Remove trailing whitespace in debian/changelog (routine-update)
-  * Add salsa-ci file (routine-update)
-  * Rules-Requires-Root: no (routine-update)
-  * Update symbols file
-  * Remove useless gbp.conf
+  * Initial importRemove useless gbp.conf
 
- -- Andreas Tille <tille@debian.org>  Sat, 02 May 2020 23:13:25 +0200
-
-deltachat-core (0.39.0+ds-0.1) unstable; urgency=high
-
-  * Non-maintainer upload.
-  * Fix broken version string. The source code is untouched.
-  * Rebuild as a source-only upload to allow testing migration.
-  * debian/control:
-    + Mark Multi-Arch status for each package.
-    + debian/*.dirs: Removed, not needed.
-
-  [ Vagrant Cascadian ]
-  * debian/control: Update Vcs-* to point to salsa.debian.org.
-
- -- Boyuan Yang <byang@debian.org>  Sun, 08 Dec 2019 12:18:38 -0500
-
-deltachat-core (0.39.0-1+ds2) unstable; urgency=medium
-
-  * Remove unnecessary hard-coded library dependencies (Closes: #919994)
-  * Fix debian/copyright paths to licenses
-
- -- Micah Anderson <micah@debian.org>  Mon, 21 Jan 2019 10:14:52 -0500
-
-deltachat-core (0.39.0-1+ds) unstable; urgency=medium
-
-  * Initial release (Closes: #912430)
-
- -- Micah Anderson <micah@debian.org>  Sat, 19 Jan 2019 10:00:51 -0400
+ -- Rafael Diniz <rafael@rhizomatica.org>  Mon, 02 Jan 2022 18:14:44 +0300
