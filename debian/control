@@ -1,7 +1,7 @@
 Source: deltachat-core-rust
 Priority: optional
 Maintainer: Micah Anderson <micah@debian.org>
-Build-Depends: debhelper-compat (= 12), cmake, pkg-config
+Build-Depends: debhelper-compat (= 12), cmake, pkg-config, cargo
 Standards-Version: 4.5.0
 Section: libs
 Homepage: https://delta.chat/
