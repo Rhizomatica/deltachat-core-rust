@@ -1,9 +1,11 @@
 //! # Download large messages manually.
 
+use std::cmp::max;
+use std::collections::BTreeMap;
+
 use anyhow::{anyhow, Result};
 use deltachat_derive::{FromSql, ToSql};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 use crate::config::Config;
 use crate::context::Context;
@@ -11,10 +13,8 @@ use crate::imap::{Imap, ImapActionResult};
 use crate::job::{self, Action, Job, Status};
 use crate::message::{Message, MsgId, Viewtype};
 use crate::mimeparser::{MimeMessage, Part};
-use crate::param::Params;
 use crate::tools::time;
 use crate::{job_try, stock_str, EventType};
-use std::cmp::max;
 
 /// Download limits should not be used below `MIN_DOWNLOAD_LIMIT`.
 ///
@@ -22,7 +22,7 @@ use std::cmp::max;
 /// need to be downloaded completely to handle them correctly,
 /// eg. to assign them to the correct chat.
 /// As these messages are typically small,
-/// they're catched by `MIN_DOWNLOAD_LIMIT`.
+/// they're caught by `MIN_DOWNLOAD_LIMIT`.
 const MIN_DOWNLOAD_LIMIT: u32 = 32768;
 
 /// If a message is downloaded only partially
@@ -34,6 +34,7 @@ pub(crate) const MIN_DELETE_SERVER_AFTER: i64 = 48 * 60 * 60;
 /// Download state of the message.
 #[derive(
     Debug,
+    Default,
     Display,
     Clone,
     Copy,
@@ -49,6 +50,7 @@ pub(crate) const MIN_DELETE_SERVER_AFTER: i64 = 48 * 60 * 60;
 #[repr(u32)]
 pub enum DownloadState {
     /// Message is fully downloaded.
+    #[default]
     Done = 0,
 
     /// Message is partially downloaded and can be fully downloaded at request.
@@ -59,12 +61,6 @@ pub enum DownloadState {
 
     /// Full download of the message is in progress.
     InProgress = 1000,
-}
-
-impl Default for DownloadState {
-    fn default() -> Self {
-        DownloadState::Done
-    }
 }
 
 impl Context {
@@ -89,11 +85,7 @@ impl MsgId {
             DownloadState::Available | DownloadState::Failure => {
                 self.update_download_state(context, DownloadState::InProgress)
                     .await?;
-                job::add(
-                    context,
-                    Job::new(Action::DownloadMsg, self.to_u32(), Params::new(), 0),
-                )
-                .await?;
+                job::add(context, Job::new(Action::DownloadMsg, self.to_u32())).await?;
             }
         }
         Ok(())
@@ -109,7 +101,7 @@ impl MsgId {
             .sql
             .execute(
                 "UPDATE msgs SET download_state=? WHERE id=?;",
-                paramsv![download_state, self],
+                (download_state, self),
             )
             .await?;
         context.emit_event(EventType::MsgsChanged {
@@ -132,7 +124,7 @@ impl Job {
     /// Called in response to `Action::DownloadMsg`.
     pub(crate) async fn download_msg(&self, context: &Context, imap: &mut Imap) -> Status {
         if let Err(err) = imap.prepare(context).await {
-            warn!(context, "download: could not connect: {:?}", err);
+            warn!(context, "download: could not connect: {:#}", err);
             return Status::RetryNow;
         }
 
@@ -141,8 +133,8 @@ impl Job {
             context
                 .sql
                 .query_row_optional(
-                    "SELECT uid, folder FROM imap WHERE rfc724_mid=? AND target!=''",
-                    paramsv![msg.rfc724_mid],
+                    "SELECT uid, folder FROM imap WHERE rfc724_mid=? AND target=folder",
+                    (&msg.rfc724_mid,),
                     |row| {
                         let server_uid: u32 = row.get(0)?;
                         let server_folder: String = row.get(1)?;
@@ -245,7 +237,7 @@ impl MimeMessage {
                 time() + max(delete_server_after, MIN_DELETE_SERVER_AFTER),
             )
             .await;
-            text += format!(" [{}]", until).as_str();
+            text += format!(" [{until}]").as_str();
         };
 
         info!(context, "Partial download: {}", text);
@@ -264,13 +256,12 @@ impl MimeMessage {
 mod tests {
     use num_traits::FromPrimitive;
 
+    use super::*;
     use crate::chat::{get_chat_msgs, send_msg};
     use crate::ephemeral::Timer;
     use crate::message::Viewtype;
     use crate::receive_imf::receive_imf_inner;
     use crate::test_utils::TestContext;
-
-    use super::*;
 
     #[test]
     fn test_downloadstate_values() {
@@ -370,7 +361,7 @@ mod tests {
         receive_imf_inner(
             &t,
             "Mr.12345678901@example.com",
-            format!("{}\n\n100k text...", header).as_bytes(),
+            format!("{header}\n\n100k text...").as_bytes(),
             false,
             None,
             false,
@@ -450,7 +441,7 @@ mod tests {
         .await?;
         let msg = bob.get_last_msg().await;
         let chat_id = msg.chat_id;
-        assert_eq!(get_chat_msgs(&bob, chat_id, 0).await?.len(), 1);
+        assert_eq!(get_chat_msgs(&bob, chat_id).await?.len(), 1);
         assert_eq!(msg.download_state(), DownloadState::Available);
 
         // downloading the status update afterwards expands to nothing and moves the placeholder to trash-chat
@@ -464,7 +455,7 @@ mod tests {
             false,
         )
         .await?;
-        assert_eq!(get_chat_msgs(&bob, chat_id, 0).await?.len(), 0);
+        assert_eq!(get_chat_msgs(&bob, chat_id).await?.len(), 0);
         assert!(Message::load_from_db(&bob, msg.id)
             .await?
             .chat_id
@@ -517,13 +508,13 @@ mod tests {
         .await?;
         let msg = bob.get_last_msg().await;
         let chat_id = msg.chat_id;
-        assert_eq!(get_chat_msgs(&bob, chat_id, 0).await?.len(), 1);
+        assert_eq!(get_chat_msgs(&bob, chat_id).await?.len(), 1);
         assert_eq!(msg.download_state(), DownloadState::Available);
 
         // downloading the mdn afterwards expands to nothing and deletes the placeholder directly
         // (usually mdn are too small for not being downloaded directly)
         receive_imf_inner(&bob, "bar@example.org", raw, false, None, false).await?;
-        assert_eq!(get_chat_msgs(&bob, chat_id, 0).await?.len(), 0);
+        assert_eq!(get_chat_msgs(&bob, chat_id).await?.len(), 0);
         assert!(Message::load_from_db(&bob, msg.id)
             .await?
             .chat_id

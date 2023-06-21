@@ -13,13 +13,6 @@ dynamic = [
     "version"
 ]
 
-[tool.setuptools]
-# We declare the package not-zip-safe so that our type hints are also available
-# when checking client code that uses our (installed) package.
-# Ref:
-# https://mypy.readthedocs.io/en/stable/installed_packages.html?highlight=zip#using-installed-packages-with-mypy-pep-561
-zip-safe = false
-
 [tool.setuptools.package-data]
 deltachat_rpc_client = [
     "py.typed"
@@ -27,3 +20,44 @@ deltachat_rpc_client = [
 
 [project.entry-points.pytest11]
 "deltachat_rpc_client.pytestplugin" = "deltachat_rpc_client.pytestplugin"
+
+[tool.setuptools_scm]
+root = ".."
+
+[tool.black]
+line-length = 120
+
+[tool.ruff]
+select = [
+  "E", "W", # pycodestyle
+  "F", # Pyflakes
+  "N", # pep8-naming
+  "I", # isort
+
+  "ARG", # flake8-unused-arguments
+  "B", # flake8-bugbear
+  "C4", # flake8-comprehensions
+  "COM", # flake8-commas
+  "DTZ", # flake8-datetimez
+  "ICN", # flake8-import-conventions
+  "ISC", # flake8-implicit-str-concat
+  "PIE", # flake8-pie
+  "PT", # flake8-pytest-style
+  "RET", # flake8-return
+  "SIM", # flake8-simplify
+  "TCH", # flake8-type-checking
+  "TID", # flake8-tidy-imports
+  "YTT", # flake8-2020
+
+  "ERA", # eradicate
+
+  "PLC", # Pylint Convention
+  "PLE", # Pylint Error
+  "PLW", # Pylint Warning
+
+  "RUF006" # asyncio-dangling-task
+]
+line-length = 120
+
+[tool.isort]
+profile = "black"

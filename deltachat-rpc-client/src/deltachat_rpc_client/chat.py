@@ -1,38 +1,29 @@
 import calendar
-from datetime import datetime
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 from ._utils import AttrDict
-from .const import ChatVisibility
+from .const import ChatVisibility, ViewType
 from .contact import Contact
 from .message import Message
-from .rpc import Rpc
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from .account import Account
+    from .rpc import Rpc
 
 
+@dataclass
 class Chat:
     """Chat object which manages members and through which you can send and retrieve messages."""
 
-    def __init__(self, account: "Account", chat_id: int) -> None:
-        self.account = account
-        self.id = chat_id
+    account: "Account"
+    id: int
 
     @property
-    def _rpc(self) -> Rpc:
+    def _rpc(self) -> "Rpc":
         return self.account._rpc
-
-    def __eq__(self, other) -> bool:
-        if not isinstance(other, Chat):
-            return False
-        return self.id == other.id and self.account == other.account
-
-    def __ne__(self, other) -> bool:
-        return not self == other
-
-    def __repr__(self) -> str:
-        return f"<Chat id={self.id} account={self.account.id}>"
 
     async def delete(self) -> None:
         """Delete this chat and all its messages.
@@ -63,7 +54,7 @@ class Chat:
         """
         if duration is not None:
             assert duration > 0, "Invalid duration"
-            dur: Union[str, dict] = dict(Until=duration)
+            dur: Union[str, dict] = {"Until": duration}
         else:
             dur = "Forever"
         await self._rpc.set_chat_mute_duration(self.account.id, self.id, dur)
@@ -74,27 +65,19 @@ class Chat:
 
     async def pin(self) -> None:
         """Pin this chat."""
-        await self._rpc.set_chat_visibility(
-            self.account.id, self.id, ChatVisibility.PINNED
-        )
+        await self._rpc.set_chat_visibility(self.account.id, self.id, ChatVisibility.PINNED)
 
     async def unpin(self) -> None:
         """Unpin this chat."""
-        await self._rpc.set_chat_visibility(
-            self.account.id, self.id, ChatVisibility.NORMAL
-        )
+        await self._rpc.set_chat_visibility(self.account.id, self.id, ChatVisibility.NORMAL)
 
     async def archive(self) -> None:
         """Archive this chat."""
-        await self._rpc.set_chat_visibility(
-            self.account.id, self.id, ChatVisibility.ARCHIVED
-        )
+        await self._rpc.set_chat_visibility(self.account.id, self.id, ChatVisibility.ARCHIVED)
 
     async def unarchive(self) -> None:
         """Unarchive this chat."""
-        await self._rpc.set_chat_visibility(
-            self.account.id, self.id, ChatVisibility.NORMAL
-        )
+        await self._rpc.set_chat_visibility(self.account.id, self.id, ChatVisibility.NORMAL)
 
     async def set_name(self, name: str) -> None:
         """Set name of this chat."""
@@ -122,20 +105,34 @@ class Chat:
         info = await self._rpc.get_full_chat_by_id(self.account.id, self.id)
         return AttrDict(chat=self, **info)
 
+    async def can_send(self) -> bool:
+        """Return true if messages can be sent to the chat."""
+        return await self._rpc.can_send(self.account.id, self.id)
+
     async def send_message(
         self,
         text: Optional[str] = None,
+        html: Optional[str] = None,
+        viewtype: Optional[ViewType] = None,
         file: Optional[str] = None,
         location: Optional[Tuple[float, float]] = None,
+        override_sender_name: Optional[str] = None,
         quoted_msg: Optional[Union[int, Message]] = None,
     ) -> Message:
         """Send a message and return the resulting Message instance."""
         if isinstance(quoted_msg, Message):
             quoted_msg = quoted_msg.id
 
-        msg_id, _ = await self._rpc.misc_send_msg(
-            self.account.id, self.id, text, file, location, quoted_msg
-        )
+        draft = {
+            "text": text,
+            "html": html,
+            "viewtype": viewtype,
+            "file": file,
+            "location": location,
+            "overrideSenderName": override_sender_name,
+            "quotedMessageId": quoted_msg,
+        }
+        msg_id = await self._rpc.send_msg(self.account.id, self.id, draft)
         return Message(self.account, msg_id)
 
     async def send_text(self, text: str) -> Message:
@@ -184,9 +181,9 @@ class Chat:
         snapshot["message"] = Message(self.account, snapshot.id)
         return snapshot
 
-    async def get_messages(self, flags: int = 0) -> List[Message]:
+    async def get_messages(self, info_only: bool = False, add_daymarker: bool = False) -> List[Message]:
         """get the list of messages in this chat."""
-        msgs = await self._rpc.get_message_ids(self.account.id, self.id, flags)
+        msgs = await self._rpc.get_message_ids(self.account.id, self.id, info_only, add_daymarker)
         return [Message(self.account, msg_id) for msg_id in msgs]
 
     async def get_fresh_message_count(self) -> int:
@@ -201,19 +198,23 @@ class Chat:
         """Add contacts to this group."""
         for cnt in contact:
             if isinstance(cnt, str):
-                cnt = (await self.account.create_contact(cnt)).id
+                contact_id = (await self.account.create_contact(cnt)).id
             elif not isinstance(cnt, int):
-                cnt = cnt.id
-            await self._rpc.add_contact_to_chat(self.account.id, self.id, cnt)
+                contact_id = cnt.id
+            else:
+                contact_id = cnt
+            await self._rpc.add_contact_to_chat(self.account.id, self.id, contact_id)
 
     async def remove_contact(self, *contact: Union[int, str, Contact]) -> None:
         """Remove members from this group."""
         for cnt in contact:
             if isinstance(cnt, str):
-                cnt = (await self.account.create_contact(cnt)).id
+                contact_id = (await self.account.create_contact(cnt)).id
             elif not isinstance(cnt, int):
-                cnt = cnt.id
-            await self._rpc.remove_contact_from_chat(self.account.id, self.id, cnt)
+                contact_id = cnt.id
+            else:
+                contact_id = cnt
+            await self._rpc.remove_contact_from_chat(self.account.id, self.id, contact_id)
 
     async def get_contacts(self) -> List[Contact]:
         """Get the contacts belonging to this chat.
@@ -237,27 +238,21 @@ class Chat:
     async def get_locations(
         self,
         contact: Optional[Contact] = None,
-        timestamp_from: Optional[datetime] = None,
-        timestamp_to: Optional[datetime] = None,
+        timestamp_from: Optional["datetime"] = None,
+        timestamp_to: Optional["datetime"] = None,
     ) -> List[AttrDict]:
         """Get list of location snapshots for the given contact in the given timespan."""
-        time_from = (
-            calendar.timegm(timestamp_from.utctimetuple()) if timestamp_from else 0
-        )
+        time_from = calendar.timegm(timestamp_from.utctimetuple()) if timestamp_from else 0
         time_to = calendar.timegm(timestamp_to.utctimetuple()) if timestamp_to else 0
         contact_id = contact.id if contact else 0
 
-        result = await self._rpc.get_locations(
-            self.account.id, self.id, contact_id, time_from, time_to
-        )
+        result = await self._rpc.get_locations(self.account.id, self.id, contact_id, time_from, time_to)
         locations = []
         contacts: Dict[int, Contact] = {}
         for loc in result:
-            loc = AttrDict(loc)
-            loc["chat"] = self
-            loc["contact"] = contacts.setdefault(
-                loc.contact_id, Contact(self.account, loc.contact_id)
-            )
-            loc["message"] = Message(self.account, loc.msg_id)
-            locations.append(loc)
+            location = AttrDict(loc)
+            location["chat"] = self
+            location["contact"] = contacts.setdefault(location.contact_id, Contact(self.account, location.contact_id))
+            location["message"] = Message(self.account, location.msg_id)
+            locations.append(location)
         return locations

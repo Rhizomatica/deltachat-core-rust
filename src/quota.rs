@@ -1,10 +1,10 @@
 //! # Support for IMAP QUOTA extension.
 
-#![allow(missing_docs)]
+use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
 
 use anyhow::{anyhow, Context as _, Result};
 use async_imap::types::{Quota, QuotaResource};
-use std::collections::BTreeMap;
 
 use crate::chat::add_device_msg_with_importance;
 use crate::config::Config;
@@ -12,18 +12,17 @@ use crate::context::Context;
 use crate::imap::scan_folders::get_watched_folders;
 use crate::imap::session::Session as ImapSession;
 use crate::imap::Imap;
-use crate::job::{Action, Status};
 use crate::message::{Message, Viewtype};
-use crate::param::Params;
+use crate::scheduler::InterruptInfo;
 use crate::tools::time;
-use crate::{job, stock_str, EventType};
+use crate::{stock_str, EventType};
 
 /// warn about a nearly full mailbox after this usage percentage is reached.
 /// quota icon is "yellow".
 pub const QUOTA_WARN_THRESHOLD_PERCENTAGE: u64 = 80;
 
-// warning again after this usage percentage is reached,
-// quota icon is "red".
+/// warning again after this usage percentage is reached,
+/// quota icon is "red".
 pub const QUOTA_ERROR_THRESHOLD_PERCENTAGE: u64 = 95;
 
 /// if quota is below this value (again),
@@ -35,10 +34,11 @@ pub const QUOTA_ERROR_THRESHOLD_PERCENTAGE: u64 = 95;
 /// providers report bad values and we would then spam the user.
 pub const QUOTA_ALLCLEAR_PERCENTAGE: u64 = 75;
 
-// if recent quota is older,
-// it is re-fetched on dc_get_connectivity_html()
+/// if recent quota is older,
+/// it is re-fetched on dc_get_connectivity_html()
 pub const QUOTA_MAX_AGE_SECONDS: i64 = 60;
 
+/// Server quota information with an update timestamp.
 #[derive(Debug)]
 pub struct QuotaInfo {
     /// Recently loaded quota information.
@@ -68,7 +68,7 @@ async fn get_unique_quota_roots_and_usage(
                     .cloned()
                     .context("quota_root should have a quota")?;
                 // replace old quotas, because between fetching quotaroots for folders,
-                // messages could be recieved and so the usage could have been changed
+                // messages could be received and so the usage could have been changed
                 *unique_quota_roots
                     .entry(quota_root_name.clone())
                     .or_insert_with(Vec::new) = quota.resources;
@@ -112,12 +112,12 @@ pub fn needs_quota_warning(curr_percentage: u64, warned_at_percentage: u64) -> b
 impl Context {
     // Adds a job to update `quota.recent`
     pub(crate) async fn schedule_quota_update(&self) -> Result<()> {
-        if !job::action_exists(self, Action::UpdateRecentQuota).await? {
-            job::add(
-                self,
-                job::Job::new(Action::UpdateRecentQuota, 0, Params::new(), 0),
-            )
-            .await?;
+        let requested = self.quota_update_request.swap(true, Ordering::Relaxed);
+        if !requested {
+            // Quota update was not requested before.
+            self.scheduler
+                .interrupt_inbox(InterruptInfo::new(false))
+                .await;
         }
         Ok(())
     }
@@ -132,10 +132,10 @@ impl Context {
     /// and new space is allocated as needed.
     ///
     /// Called in response to `Action::UpdateRecentQuota`.
-    pub(crate) async fn update_recent_quota(&self, imap: &mut Imap) -> Result<Status> {
+    pub(crate) async fn update_recent_quota(&self, imap: &mut Imap) -> Result<()> {
         if let Err(err) = imap.prepare(self).await {
-            warn!(self, "could not connect: {:?}", err);
-            return Ok(Status::RetryNow);
+            warn!(self, "could not connect: {:#}", err);
+            return Ok(());
         }
 
         let session = imap.session.as_mut().context("no session")?;
@@ -162,9 +162,12 @@ impl Context {
                         self.set_config(Config::QuotaExceeding, None).await?;
                     }
                 }
-                Err(err) => warn!(self, "cannot get highest quota usage: {:?}", err),
+                Err(err) => warn!(self, "cannot get highest quota usage: {:#}", err),
             }
         }
+
+        // Clear the request to update quota.
+        self.quota_update_request.store(false, Ordering::Relaxed);
 
         *self.quota.write().await = Some(QuotaInfo {
             recent: quota,
@@ -172,7 +175,7 @@ impl Context {
         });
 
         self.emit_event(EventType::ConnectivityChanged);
-        Ok(Status::Finished(Ok(())))
+        Ok(())
     }
 }
 

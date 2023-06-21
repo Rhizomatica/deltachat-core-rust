@@ -27,9 +27,7 @@ async def log_error(event):
 
 @hooks.on(events.MemberListChanged)
 async def on_memberlist_changed(event):
-    logging.info(
-        "member %s was %s", event.member, "added" if event.member_added else "removed"
-    )
+    logging.info("member %s was %s", event.member, "added" if event.member_added else "removed")
 
 
 @hooks.on(events.GroupImageChanged)
@@ -66,7 +64,8 @@ async def main():
 
         bot = Bot(account, hooks)
         if not await bot.is_configured():
-            asyncio.create_task(bot.configure(email=sys.argv[1], password=sys.argv[2]))
+            # Save a reference to avoid garbage collection of the task.
+            _configure_task = asyncio.create_task(bot.configure(email=sys.argv[1], password=sys.argv[2]))
         await bot.run_forever()
 
 

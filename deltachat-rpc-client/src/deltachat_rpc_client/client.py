@@ -2,6 +2,7 @@
 import inspect
 import logging
 from typing import (
+    TYPE_CHECKING,
     Callable,
     Coroutine,
     Dict,
@@ -13,15 +14,13 @@ from typing import (
     Union,
 )
 
-from deltachat_rpc_client.account import Account
-
 from ._utils import (
     AttrDict,
     parse_system_add_remove,
     parse_system_image_changed,
     parse_system_title_changed,
 )
-from .const import COMMAND_PREFIX, EventType, SystemMessageType
+from .const import COMMAND_PREFIX, EventType, SpecialContactId, SystemMessageType
 from .events import (
     EventFilter,
     GroupImageChanged,
@@ -31,13 +30,16 @@ from .events import (
     RawEvent,
 )
 
+if TYPE_CHECKING:
+    from deltachat_rpc_client.account import Account
+
 
 class Client:
     """Simple Delta Chat client that listen to events of a single account."""
 
     def __init__(
         self,
-        account: Account,
+        account: "Account",
         hooks: Optional[Iterable[Tuple[Callable, Union[type, EventFilter]]]] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
@@ -47,15 +49,11 @@ class Client:
         self._should_process_messages = 0
         self.add_hooks(hooks or [])
 
-    def add_hooks(
-        self, hooks: Iterable[Tuple[Callable, Union[type, EventFilter]]]
-    ) -> None:
+    def add_hooks(self, hooks: Iterable[Tuple[Callable, Union[type, EventFilter]]]) -> None:
         for hook, event in hooks:
             self.add_hook(hook, event)
 
-    def add_hook(
-        self, hook: Callable, event: Union[type, EventFilter] = RawEvent
-    ) -> None:
+    def add_hook(self, hook: Callable, event: Union[type, EventFilter] = RawEvent) -> None:
         """Register hook for the given event filter."""
         if isinstance(event, type):
             event = event()
@@ -64,7 +62,7 @@ class Client:
             isinstance(
                 event,
                 (NewMessage, MemberListChanged, GroupImageChanged, GroupNameChanged),
-            )
+            ),
         )
         self._hooks.setdefault(type(event), set()).add((hook, event))
 
@@ -76,7 +74,7 @@ class Client:
             isinstance(
                 event,
                 (NewMessage, MemberListChanged, GroupImageChanged, GroupNameChanged),
-            )
+            ),
         )
         self._hooks.get(type(event), set()).remove((hook, event))
 
@@ -95,9 +93,7 @@ class Client:
         """Process events forever."""
         await self.run_until(lambda _: False)
 
-    async def run_until(
-        self, func: Callable[[AttrDict], Union[bool, Coroutine]]
-    ) -> AttrDict:
+    async def run_until(self, func: Callable[[AttrDict], Union[bool, Coroutine]]) -> AttrDict:
         """Process events until the given callable evaluates to True.
 
         The callable should accept an AttrDict object representing the
@@ -122,9 +118,7 @@ class Client:
             if stop:
                 return event
 
-    async def _on_event(
-        self, event: AttrDict, filter_type: Type[EventFilter] = RawEvent
-    ) -> None:
+    async def _on_event(self, event: AttrDict, filter_type: Type[EventFilter] = RawEvent) -> None:
         for hook, evfilter in self._hooks.get(filter_type, []):
             if await evfilter.filter(event):
                 try:
@@ -133,11 +127,7 @@ class Client:
                     self.logger.exception(ex)
 
     async def _parse_command(self, event: AttrDict) -> None:
-        cmds = [
-            hook[1].command
-            for hook in self._hooks.get(NewMessage, [])
-            if hook[1].command
-        ]
+        cmds = [hook[1].command for hook in self._hooks.get(NewMessage, []) if hook[1].command]
         parts = event.message_snapshot.text.split(maxsplit=1)
         payload = parts[1] if len(parts) > 1 else ""
         cmd = parts.pop(0)
@@ -199,14 +189,11 @@ class Client:
 
     async def _process_messages(self) -> None:
         if self._should_process_messages:
-            for message in await self.account.get_fresh_messages_in_arrival_order():
+            for message in await self.account.get_next_messages():
                 snapshot = await message.get_snapshot()
-                await self._on_new_msg(snapshot)
-                if (
-                    snapshot.is_info
-                    and snapshot.system_message_type
-                    != SystemMessageType.WEBXDC_INFO_MESSAGE
-                ):
+                if snapshot.from_id not in [SpecialContactId.SELF, SpecialContactId.DEVICE]:
+                    await self._on_new_msg(snapshot)
+                if snapshot.is_info and snapshot.system_message_type != SystemMessageType.WEBXDC_INFO_MESSAGE:
                     await self._handle_info_msg(snapshot)
                 await snapshot.message.mark_seen()
 

@@ -67,8 +67,7 @@ fn receive_event(event: EventType) {
             info!(
                 "{}",
                 yellow.paint(format!(
-                    "Received MSGS_CHANGED(chat_id={}, msg_id={})",
-                    chat_id, msg_id,
+                    "Received MSGS_CHANGED(chat_id={chat_id}, msg_id={msg_id})",
                 ))
             );
         }
@@ -80,8 +79,7 @@ fn receive_event(event: EventType) {
             info!(
                 "{}",
                 yellow.paint(format!(
-                    "Received REACTIONS_CHANGED(chat_id={}, msg_id={}, contact_id={})",
-                    chat_id, msg_id, contact_id
+                    "Received REACTIONS_CHANGED(chat_id={chat_id}, msg_id={msg_id}, contact_id={contact_id})"
                 ))
             );
         }
@@ -91,7 +89,7 @@ fn receive_event(event: EventType) {
         EventType::LocationChanged(contact) => {
             info!(
                 "{}",
-                yellow.paint(format!("Received LOCATION_CHANGED(contact={:?})", contact))
+                yellow.paint(format!("Received LOCATION_CHANGED(contact={contact:?})"))
             );
         }
         EventType::ConfigureProgress { progress, comment } => {
@@ -99,21 +97,20 @@ fn receive_event(event: EventType) {
                 info!(
                     "{}",
                     yellow.paint(format!(
-                        "Received CONFIGURE_PROGRESS({} ‰, {})",
-                        progress, comment
+                        "Received CONFIGURE_PROGRESS({progress} ‰, {comment})"
                     ))
                 );
             } else {
                 info!(
                     "{}",
-                    yellow.paint(format!("Received CONFIGURE_PROGRESS({} ‰)", progress))
+                    yellow.paint(format!("Received CONFIGURE_PROGRESS({progress} ‰)"))
                 );
             }
         }
         EventType::ImexProgress(progress) => {
             info!(
                 "{}",
-                yellow.paint(format!("Received IMEX_PROGRESS({} ‰)", progress))
+                yellow.paint(format!("Received IMEX_PROGRESS({progress} ‰)"))
             );
         }
         EventType::ImexFileWritten(file) => {
@@ -125,7 +122,7 @@ fn receive_event(event: EventType) {
         EventType::ChatModified(chat) => {
             info!(
                 "{}",
-                yellow.paint(format!("Received CHAT_MODIFIED({})", chat))
+                yellow.paint(format!("Received CHAT_MODIFIED({chat})"))
             );
         }
         _ => {
@@ -155,13 +152,15 @@ impl Completer for DcHelper {
     }
 }
 
-const IMEX_COMMANDS: [&str; 12] = [
+const IMEX_COMMANDS: [&str; 14] = [
     "initiate-key-transfer",
     "get-setupcodebegin",
     "continue-key-transfer",
     "has-backup",
     "export-backup",
     "import-backup",
+    "send-backup",
+    "receive-backup",
     "export-keys",
     "import-keys",
     "export-setup",
@@ -353,8 +352,8 @@ async fn start(args: Vec<String>) -> Result<(), Error> {
             match readline {
                 Ok(line) => {
                     // TODO: ignore "set mail_pw"
-                    rl.add_history_entry(line.as_str());
-                    let contine = Handle::current().block_on(async {
+                    rl.add_history_entry(line.as_str())?;
+                    let should_continue = Handle::current().block_on(async {
                         match handle_cmd(line.trim(), ctx.clone(), &mut selected_chat).await {
                             Ok(ExitResult::Continue) => true,
                             Ok(ExitResult::Exit) => {
@@ -362,13 +361,13 @@ async fn start(args: Vec<String>) -> Result<(), Error> {
                                 false
                             }
                             Err(err) => {
-                                println!("Error: {}", err);
+                                println!("Error: {err:#}");
                                 true
                             }
                         }
                     });
 
-                    if !contine {
+                    if !should_continue {
                         break;
                     }
                 }
@@ -377,7 +376,7 @@ async fn start(args: Vec<String>) -> Result<(), Error> {
                     break;
                 }
                 Err(err) => {
-                    println!("Error: {}", err);
+                    println!("Error: {err:#}");
                     break;
                 }
             }
@@ -444,7 +443,7 @@ async fn handle_cmd(
                 if arg0 == "getbadqr" && qr.len() > 40 {
                     qr.replace_range(12..22, "0000000000")
                 }
-                println!("{}", qr);
+                println!("{qr}");
                 let output = Command::new("qrencode")
                     .args(["-t", "ansiutf8", qr.as_str(), "-o", "-"])
                     .output()
@@ -460,7 +459,7 @@ async fn handle_cmd(
             match get_securejoin_qr_svg(&ctx, group).await {
                 Ok(svg) => {
                     fs::write(&file, svg).await?;
-                    println!("QR code svg written to: {:#?}", file);
+                    println!("QR code svg written to: {file:#?}");
                 }
                 Err(err) => {
                     bail!("Failed to get QR code svg: {}", err);

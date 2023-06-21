@@ -1,5 +1,8 @@
 //! # Message summary for chatlist.
 
+use std::borrow::Cow;
+use std::fmt;
+
 use crate::chat::Chat;
 use crate::constants::Chattype;
 use crate::contact::{Contact, ContactId};
@@ -9,8 +12,6 @@ use crate::mimeparser::SystemMessage;
 use crate::param::Param;
 use crate::stock_str;
 use crate::tools::truncate;
-use std::borrow::Cow;
-use std::fmt;
 
 /// Prefix displayed before message and separated by ":" in the chatlist.
 #[derive(Debug)]
@@ -28,9 +29,9 @@ pub enum SummaryPrefix {
 impl fmt::Display for SummaryPrefix {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            SummaryPrefix::Username(username) => write!(f, "{}", username),
-            SummaryPrefix::Draft(text) => write!(f, "{}", text),
-            SummaryPrefix::Me(text) => write!(f, "{}", text),
+            SummaryPrefix::Username(username) => write!(f, "{username}"),
+            SummaryPrefix::Draft(text) => write!(f, "{text}"),
+            SummaryPrefix::Me(text) => write!(f, "{text}"),
         }
     }
 }
@@ -49,10 +50,13 @@ pub struct Summary {
 
     /// Message state.
     pub state: MessageState,
+
+    /// Message preview image path
+    pub thumbnail_path: Option<String>,
 }
 
 impl Summary {
-    /// Constucts chatlist summary
+    /// Constructs chatlist summary
     /// from the provided message, chat and message author contact snapshots.
     pub async fn new(
         context: &Context,
@@ -89,11 +93,22 @@ impl Summary {
             text = stock_str::reply_noun(context).await
         }
 
+        let thumbnail_path = if msg.viewtype == Viewtype::Image
+            || msg.viewtype == Viewtype::Gif
+            || msg.viewtype == Viewtype::Sticker
+        {
+            msg.get_file(context)
+                .and_then(|path| path.to_str().map(|p| p.to_owned()))
+        } else {
+            None
+        };
+
         Self {
             prefix,
             text,
             timestamp: msg.get_timestamp(),
             state: msg.state,
+            thumbnail_path,
         }
     }
 
@@ -132,7 +147,7 @@ impl Message {
                     } else {
                         stock_str::file(context).await
                     };
-                    format!("{} – {}", label, file_name)
+                    format!("{label} – {file_name}")
                 }
             }
             Viewtype::VideochatInvitation => {
@@ -166,7 +181,7 @@ impl Message {
             } else if prefix.is_empty() {
                 text.to_string()
             } else {
-                format!("{} – {}", prefix, text)
+                format!("{prefix} – {text}")
             }
         } else {
             prefix

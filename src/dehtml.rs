@@ -152,7 +152,7 @@ fn dehtml_endtag_cb(event: &BytesEnd, dehtml: &mut Dehtml) {
         .to_lowercase();
 
     match tag.as_str() {
-        "p" | "table" | "td" | "style" | "script" | "title" | "pre" => {
+        "style" | "script" | "title" | "pre" => {
             dehtml.strbuilder += &dehtml.append_prefix("\n\n");
             dehtml.add_text = AddText::YesRemoveLineEnds;
         }
@@ -165,9 +165,13 @@ fn dehtml_endtag_cb(event: &BytesEnd, dehtml: &mut Dehtml) {
         }
         "a" => {
             if let Some(ref last_href) = dehtml.last_href.take() {
-                dehtml.strbuilder += "](";
-                dehtml.strbuilder += last_href;
-                dehtml.strbuilder += ")";
+                if dehtml.strbuilder.ends_with('[') {
+                    dehtml.strbuilder.truncate(dehtml.strbuilder.len() - 1);
+                } else {
+                    dehtml.strbuilder += "](";
+                    dehtml.strbuilder += last_href;
+                    dehtml.strbuilder += ")";
+                }
             }
         }
         "b" | "strong" => {
@@ -196,7 +200,9 @@ fn dehtml_starttag_cb<B: std::io::BufRead>(
 
     match tag.as_str() {
         "p" | "table" | "td" => {
-            dehtml.strbuilder += &dehtml.append_prefix("\n\n");
+            if !dehtml.strbuilder.is_empty() {
+                dehtml.strbuilder += &dehtml.append_prefix("\n\n");
+            }
             dehtml.add_text = AddText::YesRemoveLineEnds;
         }
         #[rustfmt::skip]
@@ -323,9 +329,10 @@ mod tests {
             ("&amp; bar", "& bar"),
             // Despite missing ', this should be shown:
             ("<a href='/foo.png>Hi</a> ", "Hi "),
+            ("No link: <a href='https://get.delta.chat/'/>", "No link: "),
             (
-                "<a href='https://get.delta.chat/'/>",
-                "[](https://get.delta.chat/)",
+                "No link: <a href='https://get.delta.chat/'></a>",
+                "No link: ",
             ),
             ("<!doctype html>\n<b>fat text</b>", "*fat text*"),
             // Invalid html (at least DC should show the text if the html is invalid):
@@ -346,6 +353,21 @@ mod tests {
         let plain = dehtml(html).unwrap();
 
         assert_eq!(plain, "line1\n\r\r\rline2\nline3");
+    }
+
+    #[test]
+    fn test_dehtml_parse_p() {
+        let html = "<p>Foo</p><p>Bar</p>";
+        let plain = dehtml(html).unwrap();
+        assert_eq!(plain, "Foo\n\nBar");
+
+        let html = "<p>Foo<p>Bar";
+        let plain = dehtml(html).unwrap();
+        assert_eq!(plain, "Foo\n\nBar");
+
+        let html = "<p>Foo</p><p>Bar<p>Baz";
+        let plain = dehtml(html).unwrap();
+        assert_eq!(plain, "Foo\n\nBar\n\nBaz");
     }
 
     #[test]
@@ -407,7 +429,7 @@ mod tests {
     async fn test_quote_div() {
         let input = include_str!("../test-data/message/gmx-quote-body.eml");
         let dehtml = dehtml(input).unwrap();
-        println!("{}", dehtml);
+        println!("{dehtml}");
         let SimplifiedText {
             text,
             is_forwarded,

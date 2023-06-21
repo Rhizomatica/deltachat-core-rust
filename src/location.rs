@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use anyhow::{ensure, Context as _, Result};
 use async_channel::Receiver;
-use bitflags::bitflags;
 use quick_xml::events::{BytesEnd, BytesStart, BytesText};
 use tokio::time::timeout;
 
@@ -78,16 +77,15 @@ pub struct Kml {
     pub curr: Location,
 }
 
-bitflags! {
-    #[derive(Default)]
-    struct KmlTag: i32 {
-        const UNDEFINED = 0x00;
-        const PLACEMARK = 0x01;
-        const TIMESTAMP = 0x02;
-        const WHEN = 0x04;
-        const POINT = 0x08;
-        const COORDINATES = 0x10;
-    }
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+enum KmlTag {
+    #[default]
+    Undefined,
+    Placemark,
+    PlacemarkTimestamp,
+    PlacemarkTimestampWhen,
+    PlacemarkPoint,
+    PlacemarkPointCoordinates,
 }
 
 impl Kml {
@@ -128,12 +126,14 @@ impl Kml {
     }
 
     fn text_cb(&mut self, event: &BytesText) {
-        if self.tag.contains(KmlTag::WHEN) || self.tag.contains(KmlTag::COORDINATES) {
+        if self.tag == KmlTag::PlacemarkTimestampWhen
+            || self.tag == KmlTag::PlacemarkPointCoordinates
+        {
             let val = event.unescape().unwrap_or_default();
 
             let val = val.replace(['\n', '\r', '\t', ' '], "");
 
-            if self.tag.contains(KmlTag::WHEN) && val.len() >= 19 {
+            if self.tag == KmlTag::PlacemarkTimestampWhen && val.len() >= 19 {
                 // YYYY-MM-DDTHH:MM:SSZ
                 // 0   4  7  10 13 16 19
                 match chrono::NaiveDateTime::parse_from_str(&val, "%Y-%m-%dT%H:%M:%SZ") {
@@ -147,7 +147,7 @@ impl Kml {
                         self.curr.timestamp = time();
                     }
                 }
-            } else if self.tag.contains(KmlTag::COORDINATES) {
+            } else if self.tag == KmlTag::PlacemarkPointCoordinates {
                 let parts = val.splitn(2, ',').collect::<Vec<_>>();
                 if let [longitude, latitude] = &parts[..] {
                     self.curr.longitude = longitude.parse().unwrap_or_default();
@@ -162,17 +162,41 @@ impl Kml {
             .trim()
             .to_lowercase();
 
-        if tag == "placemark" {
-            if self.tag.contains(KmlTag::PLACEMARK)
-                && 0 != self.curr.timestamp
-                && 0. != self.curr.latitude
-                && 0. != self.curr.longitude
-            {
-                self.locations
-                    .push(std::mem::replace(&mut self.curr, Location::new()));
+        match self.tag {
+            KmlTag::PlacemarkTimestampWhen => {
+                if tag == "when" {
+                    self.tag = KmlTag::PlacemarkTimestamp
+                }
             }
-            self.tag = KmlTag::UNDEFINED;
-        };
+            KmlTag::PlacemarkTimestamp => {
+                if tag == "timestamp" {
+                    self.tag = KmlTag::Placemark
+                }
+            }
+            KmlTag::PlacemarkPointCoordinates => {
+                if tag == "coordinates" {
+                    self.tag = KmlTag::PlacemarkPoint
+                }
+            }
+            KmlTag::PlacemarkPoint => {
+                if tag == "point" {
+                    self.tag = KmlTag::Placemark
+                }
+            }
+            KmlTag::Placemark => {
+                if tag == "placemark" {
+                    if 0 != self.curr.timestamp
+                        && 0. != self.curr.latitude
+                        && 0. != self.curr.longitude
+                    {
+                        self.locations
+                            .push(std::mem::replace(&mut self.curr, Location::new()));
+                    }
+                    self.tag = KmlTag::Undefined;
+                }
+            }
+            KmlTag::Undefined => {}
+        }
     }
 
     fn starttag_cb<B: std::io::BufRead>(
@@ -196,19 +220,19 @@ impl Kml {
                     .map(|a| a.into_owned());
             }
         } else if tag == "placemark" {
-            self.tag = KmlTag::PLACEMARK;
+            self.tag = KmlTag::Placemark;
             self.curr.timestamp = 0;
             self.curr.latitude = 0.0;
             self.curr.longitude = 0.0;
             self.curr.accuracy = 0.0
-        } else if tag == "timestamp" && self.tag.contains(KmlTag::PLACEMARK) {
-            self.tag = KmlTag::PLACEMARK | KmlTag::TIMESTAMP
-        } else if tag == "when" && self.tag.contains(KmlTag::TIMESTAMP) {
-            self.tag = KmlTag::PLACEMARK | KmlTag::TIMESTAMP | KmlTag::WHEN
-        } else if tag == "point" && self.tag.contains(KmlTag::PLACEMARK) {
-            self.tag = KmlTag::PLACEMARK | KmlTag::POINT
-        } else if tag == "coordinates" && self.tag.contains(KmlTag::POINT) {
-            self.tag = KmlTag::PLACEMARK | KmlTag::POINT | KmlTag::COORDINATES;
+        } else if tag == "timestamp" && self.tag == KmlTag::Placemark {
+            self.tag = KmlTag::PlacemarkTimestamp;
+        } else if tag == "when" && self.tag == KmlTag::PlacemarkTimestamp {
+            self.tag = KmlTag::PlacemarkTimestampWhen;
+        } else if tag == "point" && self.tag == KmlTag::Placemark {
+            self.tag = KmlTag::PlacemarkPoint;
+        } else if tag == "coordinates" && self.tag == KmlTag::PlacemarkPoint {
+            self.tag = KmlTag::PlacemarkPointCoordinates;
             if let Some(acc) = event.attributes().find(|attr| {
                 attr.as_ref()
                     .map(|a| {
@@ -247,11 +271,11 @@ pub async fn send_locations_to_chat(
          SET locations_send_begin=?,        \
          locations_send_until=?  \
          WHERE id=?",
-            paramsv![
+            (
                 if 0 != seconds { now } else { 0 },
                 if 0 != seconds { now + seconds } else { 0 },
                 chat_id,
-            ],
+            ),
         )
         .await?;
     if 0 != seconds && !is_sending_locations_before {
@@ -267,7 +291,7 @@ pub async fn send_locations_to_chat(
     }
     context.emit_event(EventType::ChatModified(chat_id));
     if 0 != seconds {
-        context.interrupt_location().await;
+        context.scheduler.interrupt_location().await;
     }
     Ok(())
 }
@@ -286,7 +310,7 @@ pub async fn is_sending_locations_to_chat(
                 .sql
                 .exists(
                     "SELECT COUNT(id) FROM chats  WHERE id=?  AND locations_send_until>?;",
-                    paramsv![chat_id, time()],
+                    (chat_id, time()),
                 )
                 .await?
         }
@@ -295,7 +319,7 @@ pub async fn is_sending_locations_to_chat(
                 .sql
                 .exists(
                     "SELECT COUNT(id) FROM chats  WHERE locations_send_until>?;",
-                    paramsv![time()],
+                    (time(),),
                 )
                 .await?
         }
@@ -314,7 +338,7 @@ pub async fn set(context: &Context, latitude: f64, longitude: f64, accuracy: f64
         .sql
         .query_map(
             "SELECT id FROM chats WHERE locations_send_until>?;",
-            paramsv![time()],
+            (time(),),
             |row| row.get::<_, i32>(0),
             |chats| {
                 chats
@@ -328,16 +352,16 @@ pub async fn set(context: &Context, latitude: f64, longitude: f64, accuracy: f64
             if let Err(err) = context.sql.execute(
                     "INSERT INTO locations  \
                      (latitude, longitude, accuracy, timestamp, chat_id, from_id) VALUES (?,?,?,?,?,?);",
-                    paramsv![
+                     (
                         latitude,
                         longitude,
                         accuracy,
                         time(),
                         chat_id,
                         ContactId::SELF,
-                    ]
+                    )
             ).await {
-                warn!(context, "failed to store location {:?}", err);
+                warn!(context, "failed to store location {:#}", err);
             } else {
                 info!(context, "stored location for chat {}", chat_id);
                 continue_streaming = true;
@@ -380,14 +404,14 @@ pub async fn get_range(
              AND (? OR l.from_id=?) \
              AND (l.independent=1 OR (l.timestamp>=? AND l.timestamp<=?)) \
              ORDER BY l.timestamp DESC, l.id DESC, msg_id DESC;",
-            paramsv![
+            (
                 disable_chat_id,
                 chat_id,
                 disable_contact_id,
                 contact_id as i32,
                 timestamp_from,
                 timestamp_to,
-            ],
+            ),
             |row| {
                 let msg_id = row.get(6)?;
                 let txt: String = row.get(9)?;
@@ -434,10 +458,7 @@ fn is_marker(txt: &str) -> bool {
 
 /// Deletes all locations from the database.
 pub async fn delete_all(context: &Context) -> Result<()> {
-    context
-        .sql
-        .execute("DELETE FROM locations;", paramsv![])
-        .await?;
+    context.sql.execute("DELETE FROM locations;", ()).await?;
     context.emit_event(EventType::LocationChanged(None));
     Ok(())
 }
@@ -450,7 +471,7 @@ pub async fn get_kml(context: &Context, chat_id: ChatId) -> Result<(String, u32)
 
     let (locations_send_begin, locations_send_until, locations_last_sent) = context.sql.query_row(
         "SELECT locations_send_begin, locations_send_until, locations_last_sent  FROM chats  WHERE id=?;",
-        paramsv![chat_id], |row| {
+        (chat_id,), |row| {
             let send_begin: i64 = row.get(0)?;
             let send_until: i64 = row.get(1)?;
             let last_sent: i64 = row.get(2)?;
@@ -465,8 +486,7 @@ pub async fn get_kml(context: &Context, chat_id: ChatId) -> Result<(String, u32)
     if locations_send_begin != 0 && now <= locations_send_until {
         ret += &format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-            <kml xmlns=\"http://www.opengis.net/kml/2.2\">\n<Document addr=\"{}\">\n",
-            self_addr,
+            <kml xmlns=\"http://www.opengis.net/kml/2.2\">\n<Document addr=\"{self_addr}\">\n",
         );
 
         context
@@ -480,12 +500,12 @@ pub async fn get_kml(context: &Context, chat_id: ChatId) -> Result<(String, u32)
              AND independent=0 \
              GROUP BY timestamp \
              ORDER BY timestamp;",
-                paramsv![
+             (
                     ContactId::SELF,
                     locations_send_begin,
                     locations_last_sent,
                     ContactId::SELF
-                ],
+                ),
                 |row| {
                     let location_id: i32 = row.get(0)?;
                     let latitude: f64 = row.get(1)?;
@@ -500,10 +520,9 @@ pub async fn get_kml(context: &Context, chat_id: ChatId) -> Result<(String, u32)
                         let (location_id, latitude, longitude, accuracy, timestamp) = row?;
                         ret += &format!(
                             "<Placemark>\
-                <Timestamp><when>{}</when></Timestamp>\
-                <Point><coordinates accuracy=\"{}\">{},{}</coordinates></Point>\
-                </Placemark>\n",
-                            timestamp, accuracy, longitude, latitude
+                <Timestamp><when>{timestamp}</when></Timestamp>\
+                <Point><coordinates accuracy=\"{accuracy}\">{longitude},{latitude}</coordinates></Point>\
+                </Placemark>\n"
                         );
                         location_count += 1;
                         last_added_location_id = location_id as u32;
@@ -556,7 +575,7 @@ pub async fn set_kml_sent_timestamp(
         .sql
         .execute(
             "UPDATE chats SET locations_last_sent=? WHERE id=?;",
-            paramsv![timestamp, chat_id],
+            (timestamp, chat_id),
         )
         .await?;
     Ok(())
@@ -568,7 +587,7 @@ pub async fn set_msg_location_id(context: &Context, msg_id: MsgId, location_id: 
         .sql
         .execute(
             "UPDATE msgs SET location_id=? WHERE id=?;",
-            paramsv![location_id, msg_id],
+            (location_id, msg_id),
         )
         .await?;
 
@@ -603,32 +622,38 @@ pub(crate) async fn save(
             ..
         } = location;
 
-        let conn = context.sql.get_conn().await?;
-        let mut stmt_test =
-            conn.prepare_cached("SELECT id FROM locations WHERE timestamp=? AND from_id=?")?;
-        let mut stmt_insert = conn.prepare_cached(stmt_insert)?;
+        context
+            .sql
+            .call_write(|conn| {
+                let mut stmt_test = conn
+                    .prepare_cached("SELECT id FROM locations WHERE timestamp=? AND from_id=?")?;
+                let mut stmt_insert = conn.prepare_cached(stmt_insert)?;
 
-        let exists = stmt_test.exists(paramsv![timestamp, contact_id])?;
+                let exists = stmt_test.exists((timestamp, contact_id))?;
 
-        if independent || !exists {
-            stmt_insert.execute(paramsv![
-                timestamp,
-                contact_id,
-                chat_id,
-                latitude,
-                longitude,
-                accuracy,
-                independent,
-            ])?;
+                if independent || !exists {
+                    stmt_insert.execute((
+                        timestamp,
+                        contact_id,
+                        chat_id,
+                        latitude,
+                        longitude,
+                        accuracy,
+                        independent,
+                    ))?;
 
-            if timestamp > newest_timestamp {
-                // okay to drop, as we use cached prepared statements
-                drop(stmt_test);
-                drop(stmt_insert);
-                newest_timestamp = timestamp;
-                newest_location_id = Some(u32::try_from(conn.last_insert_rowid())?);
-            }
-        }
+                    if timestamp > newest_timestamp {
+                        // okay to drop, as we use cached prepared statements
+                        drop(stmt_test);
+                        drop(stmt_insert);
+                        newest_timestamp = timestamp;
+                        newest_location_id = Some(u32::try_from(conn.last_insert_rowid())?);
+                    }
+                }
+
+                Ok(())
+            })
+            .await?;
     }
 
     Ok(newest_location_id)
@@ -638,7 +663,7 @@ pub(crate) async fn location_loop(context: &Context, interrupt_receiver: Receive
     loop {
         let next_event = match maybe_send_locations(context).await {
             Err(err) => {
-                warn!(context, "maybe_send_locations failed: {}", err);
+                warn!(context, "maybe_send_locations failed: {:#}", err);
                 Some(60) // Retry one minute later.
             }
             Ok(next_event) => next_event,
@@ -704,7 +729,7 @@ async fn maybe_send_locations(context: &Context) -> Result<Option<u64>> {
      AND timestamp>=? \
      AND timestamp>? \
      AND independent=0",
-                    paramsv![ContactId::SELF, locations_send_begin, locations_last_sent,],
+                    (ContactId::SELF, locations_send_begin, locations_last_sent),
                 )
                 .await?;
 
@@ -756,7 +781,7 @@ async fn maybe_send_locations(context: &Context) -> Result<Option<u64>> {
                     "UPDATE chats \
                          SET locations_send_begin=0, locations_send_until=0 \
                          WHERE id=?",
-                    paramsv![chat_id],
+                    (chat_id,),
                 )
                 .await
                 .context("failed to disable location streaming")?;

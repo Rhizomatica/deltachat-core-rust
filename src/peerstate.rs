@@ -1,15 +1,15 @@
 //! # [Autocrypt Peer State](https://autocrypt.org/level1.html#peer-state-management) module.
 
-#![allow(missing_docs)]
-
 use std::collections::HashSet;
-use std::fmt;
+
+use anyhow::{Context as _, Error, Result};
+use num_traits::FromPrimitive;
 
 use crate::aheader::{Aheader, EncryptPreference};
 use crate::chat::{self, Chat};
 use crate::chatlist::Chatlist;
 use crate::constants::Chattype;
-use crate::contact::{addr_cmp, Contact, Origin};
+use crate::contact::{addr_cmp, Contact, ContactAddress, Origin};
 use crate::context::Context;
 use crate::events::EventType;
 use crate::key::{DcKey, Fingerprint, SignedPublicKey};
@@ -17,80 +17,82 @@ use crate::message::Message;
 use crate::mimeparser::SystemMessage;
 use crate::sql::Sql;
 use crate::stock_str;
-use anyhow::{Context as _, Result};
-use num_traits::FromPrimitive;
 
+/// Type of the public key stored inside the peerstate.
 #[derive(Debug)]
 pub enum PeerstateKeyType {
+    /// Pubilc key sent in the `Autocrypt-Gossip` header.
     GossipKey,
+
+    /// Public key sent in the `Autocrypt` header.
     PublicKey,
 }
 
+/// Verification status of the contact peerstate.
 #[derive(Debug, PartialEq, Eq, Clone, Copy, FromPrimitive)]
 #[repr(u8)]
 pub enum PeerstateVerifiedStatus {
+    /// Peerstate is not verified.
     Unverified = 0,
     //Verified = 1, // not used
+    /// Peerstate is verified and we assume that the contact has verified our peerstate.
     BidirectVerified = 2,
 }
 
 /// Peerstate represents the state of an Autocrypt peer.
+#[derive(Debug, PartialEq, Eq)]
 pub struct Peerstate {
+    /// E-mail address of the contact.
     pub addr: String,
+
+    /// Timestamp of the latest peerstate update.
+    ///
+    /// Updated when a message is received from a contact,
+    /// either with or without `Autocrypt` header.
     pub last_seen: i64,
+
+    /// Timestamp of the latest `Autocrypt` header reception.
     pub last_seen_autocrypt: i64,
+
+    /// Encryption preference of the contact.
     pub prefer_encrypt: EncryptPreference,
+
+    /// Public key of the contact received in `Autocrypt` header.
     pub public_key: Option<SignedPublicKey>,
+
+    /// Fingerprint of the contact public key.
     pub public_key_fingerprint: Option<Fingerprint>,
+
+    /// Public key of the contact received in `Autocrypt-Gossip` header.
     pub gossip_key: Option<SignedPublicKey>,
+
+    /// Timestamp of the latest `Autocrypt-Gossip` header reception.
+    ///
+    /// It is stored to avoid applying outdated gossiped key
+    /// from delayed or reordered messages.
     pub gossip_timestamp: i64,
+
+    /// Fingerprint of the contact gossip key.
     pub gossip_key_fingerprint: Option<Fingerprint>,
+
+    /// Public key of the contact at the time it was verified,
+    /// either directly or via gossip from the verified contact.
     pub verified_key: Option<SignedPublicKey>,
+
+    /// Fingerprint of the verified public key.
     pub verified_key_fingerprint: Option<Fingerprint>,
+
+    /// True if it was detected
+    /// that the fingerprint of the key used in chats with
+    /// opportunistic encryption was changed after Peerstate creation.
     pub fingerprint_changed: bool,
+
     /// The address that verified this contact
     pub verifier: Option<String>,
 }
 
-impl PartialEq for Peerstate {
-    fn eq(&self, other: &Peerstate) -> bool {
-        self.addr == other.addr
-            && self.last_seen == other.last_seen
-            && self.last_seen_autocrypt == other.last_seen_autocrypt
-            && self.prefer_encrypt == other.prefer_encrypt
-            && self.public_key == other.public_key
-            && self.public_key_fingerprint == other.public_key_fingerprint
-            && self.gossip_key == other.gossip_key
-            && self.gossip_timestamp == other.gossip_timestamp
-            && self.gossip_key_fingerprint == other.gossip_key_fingerprint
-            && self.verified_key == other.verified_key
-            && self.verified_key_fingerprint == other.verified_key_fingerprint
-            && self.fingerprint_changed == other.fingerprint_changed
-    }
-}
-
-impl Eq for Peerstate {}
-
-impl fmt::Debug for Peerstate {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("Peerstate")
-            .field("addr", &self.addr)
-            .field("last_seen", &self.last_seen)
-            .field("last_seen_autocrypt", &self.last_seen_autocrypt)
-            .field("prefer_encrypt", &self.prefer_encrypt)
-            .field("public_key", &self.public_key)
-            .field("public_key_fingerprint", &self.public_key_fingerprint)
-            .field("gossip_key", &self.gossip_key)
-            .field("gossip_timestamp", &self.gossip_timestamp)
-            .field("gossip_key_fingerprint", &self.gossip_key_fingerprint)
-            .field("verified_key", &self.verified_key)
-            .field("verified_key_fingerprint", &self.verified_key_fingerprint)
-            .field("fingerprint_changed", &self.fingerprint_changed)
-            .finish()
-    }
-}
-
 impl Peerstate {
+    /// Creates a peerstate from the `Autocrypt` header.
     pub fn from_header(header: &Aheader, message_time: i64) -> Self {
         Peerstate {
             addr: header.addr.clone(),
@@ -109,7 +111,7 @@ impl Peerstate {
         }
     }
 
-    /// Create peerstate from gossip
+    /// Create a peerstate from the `Autocrypt-Gossip` header.
     pub fn from_gossip(gossip_header: &Aheader, message_time: i64) -> Self {
         Peerstate {
             addr: gossip_header.addr.clone(),
@@ -135,15 +137,17 @@ impl Peerstate {
         }
     }
 
+    /// Loads peerstate corresponding to the given address from the database.
     pub async fn from_addr(context: &Context, addr: &str) -> Result<Option<Peerstate>> {
         let query = "SELECT addr, last_seen, last_seen_autocrypt, prefer_encrypted, public_key, \
                      gossip_timestamp, gossip_key, public_key_fingerprint, gossip_key_fingerprint, \
                      verified_key, verified_key_fingerprint, verifier \
                      FROM acpeerstates \
                      WHERE addr=? COLLATE NOCASE LIMIT 1;";
-        Self::from_stmt(context, query, paramsv![addr]).await
+        Self::from_stmt(context, query, (addr,)).await
     }
 
+    /// Loads peerstate corresponding to the given fingerprint from the database.
     pub async fn from_fingerprint(
         context: &Context,
         fingerprint: &Fingerprint,
@@ -156,9 +160,13 @@ impl Peerstate {
                      OR gossip_key_fingerprint=? \
                      ORDER BY public_key_fingerprint=? DESC LIMIT 1;";
         let fp = fingerprint.hex();
-        Self::from_stmt(context, query, paramsv![fp, fp, fp]).await
+        Self::from_stmt(context, query, (&fp, &fp, &fp)).await
     }
 
+    /// Loads peerstate by address or verified fingerprint.
+    ///
+    /// If the address is different but verified fingerprint is the same,
+    /// peerstate with corresponding verified fingerprint is preferred.
     pub async fn from_verified_fingerprint_or_addr(
         context: &Context,
         fingerprint: &Fingerprint,
@@ -172,13 +180,13 @@ impl Peerstate {
                      OR addr=? COLLATE NOCASE \
                      ORDER BY verified_key_fingerprint=? DESC, last_seen DESC LIMIT 1;";
         let fp = fingerprint.hex();
-        Self::from_stmt(context, query, paramsv![fp, addr, fp]).await
+        Self::from_stmt(context, query, (&fp, &addr, &fp)).await
     }
 
     async fn from_stmt(
         context: &Context,
         query: &str,
-        params: impl rusqlite::Params,
+        params: impl rusqlite::Params + Send,
     ) -> Result<Option<Peerstate>> {
         let peerstate = context
             .sql
@@ -223,7 +231,10 @@ impl Peerstate {
                         .transpose()
                         .unwrap_or_default(),
                     fingerprint_changed: false,
-                    verifier: row.get("verifier")?,
+                    verifier: {
+                        let verifier: Option<String> = row.get("verifier")?;
+                        verifier.filter(|verifier| !verifier.is_empty())
+                    },
                 };
 
                 Ok(res)
@@ -265,11 +276,15 @@ impl Peerstate {
         }
     }
 
+    /// Reset Autocrypt peerstate.
+    ///
+    /// Used when it is detected that the contact no longer uses Autocrypt.
     pub fn degrade_encryption(&mut self, message_time: i64) {
         self.prefer_encrypt = EncryptPreference::Reset;
         self.last_seen = message_time;
     }
 
+    /// Updates peerstate according to the given `Autocrypt` header.
     pub fn apply_header(&mut self, header: &Aheader, message_time: i64) {
         if !addr_cmp(&self.addr, &header.addr) {
             return;
@@ -292,6 +307,7 @@ impl Peerstate {
         }
     }
 
+    /// Updates peerstate according to the given `Autocrypt-Gossip` header.
     pub fn apply_gossip(&mut self, gossip_header: &Aheader, message_time: i64) {
         if self.addr.to_lowercase() != gossip_header.addr.to_lowercase() {
             return;
@@ -324,6 +340,7 @@ impl Peerstate {
         };
     }
 
+    /// Returns the contents of the `Autocrypt-Gossip` header for outgoing messages.
     pub fn render_gossip_header(&self, min_verified: PeerstateVerifiedStatus) -> Option<String> {
         if let Some(key) = self.peek_key(min_verified) {
             let header = Aheader::new(
@@ -345,6 +362,9 @@ impl Peerstate {
         }
     }
 
+    /// Converts the peerstate into the contact public key.
+    ///
+    /// Similar to [`Self::peek_key`], but consumes the peerstate and returns owned key.
     pub fn take_key(mut self, min_verified: PeerstateVerifiedStatus) -> Option<SignedPublicKey> {
         match min_verified {
             PeerstateVerifiedStatus::BidirectVerified => self.verified_key.take(),
@@ -354,6 +374,15 @@ impl Peerstate {
         }
     }
 
+    /// Returns a reference to the contact public key.
+    ///
+    /// `min_verified` determines the minimum required verification status of the key.
+    /// If verified key is requested, returns the verified key,
+    /// otherwise returns the Autocrypt key.
+    ///
+    /// Returned key is suitable for sending in `Autocrypt-Gossip` header.
+    ///
+    /// Returns `None` if there is no suitable public key.
     pub fn peek_key(&self, min_verified: PeerstateVerifiedStatus) -> Option<&SignedPublicKey> {
         match min_verified {
             PeerstateVerifiedStatus::BidirectVerified => self.verified_key.as_ref(),
@@ -369,46 +398,50 @@ impl Peerstate {
     /// verifier:
     ///   The address which verifies the given contact
     ///   If we are verifying the contact, use that contacts address
-    /// Returns whether the value of the key has changed
     pub fn set_verified(
         &mut self,
         which_key: PeerstateKeyType,
-        fingerprint: &Fingerprint,
+        fingerprint: Fingerprint,
         verified: PeerstateVerifiedStatus,
         verifier: String,
-    ) -> bool {
+    ) -> Result<()> {
         if verified == PeerstateVerifiedStatus::BidirectVerified {
             match which_key {
                 PeerstateKeyType::PublicKey => {
                     if self.public_key_fingerprint.is_some()
-                        && self.public_key_fingerprint.as_ref().unwrap() == fingerprint
+                        && self.public_key_fingerprint.as_ref().unwrap() == &fingerprint
                     {
                         self.verified_key = self.public_key.clone();
-                        self.verified_key_fingerprint = self.public_key_fingerprint.clone();
+                        self.verified_key_fingerprint = Some(fingerprint);
                         self.verifier = Some(verifier);
-                        true
+                        Ok(())
                     } else {
-                        false
+                        Err(Error::msg(format!(
+                            "{fingerprint} is not peer's public key fingerprint",
+                        )))
                     }
                 }
                 PeerstateKeyType::GossipKey => {
                     if self.gossip_key_fingerprint.is_some()
-                        && self.gossip_key_fingerprint.as_ref().unwrap() == fingerprint
+                        && self.gossip_key_fingerprint.as_ref().unwrap() == &fingerprint
                     {
                         self.verified_key = self.gossip_key.clone();
-                        self.verified_key_fingerprint = self.gossip_key_fingerprint.clone();
+                        self.verified_key_fingerprint = Some(fingerprint);
                         self.verifier = Some(verifier);
-                        true
+                        Ok(())
                     } else {
-                        false
+                        Err(Error::msg(format!(
+                            "{fingerprint} is not peer's gossip key fingerprint",
+                        )))
                     }
                 }
             }
         } else {
-            false
+            Err(Error::msg("BidirectVerified required"))
         }
     }
 
+    /// Saves the peerstate to the database.
     pub async fn save_to_db(&self, sql: &Sql) -> Result<()> {
         sql.execute(
             "INSERT INTO acpeerstates (
@@ -438,7 +471,7 @@ impl Peerstate {
                   verified_key = excluded.verified_key,
                   verified_key_fingerprint = excluded.verified_key_fingerprint,
                   verifier = excluded.verifier",
-            paramsv![
+            (
                 self.last_seen,
                 self.last_seen_autocrypt,
                 self.prefer_encrypt as i64,
@@ -449,14 +482,15 @@ impl Peerstate {
                 self.gossip_key_fingerprint.as_ref().map(|fp| fp.hex()),
                 self.verified_key.as_ref().map(|k| k.to_bytes()),
                 self.verified_key_fingerprint.as_ref().map(|fp| fp.hex()),
-                self.addr,
-                self.verifier,
-            ],
+                &self.addr,
+                self.verifier.as_deref().unwrap_or(""),
+            ),
         )
         .await?;
         Ok(())
     }
 
+    /// Returns true if verified key is contained in the given set of fingerprints.
     pub fn has_verified_key(&self, fingerprints: &HashSet<Fingerprint>) -> bool {
         if let Some(vkc) = &self.verified_key_fingerprint {
             fingerprints.contains(vkc) && self.verified_key.is_some()
@@ -490,7 +524,7 @@ impl Peerstate {
             .sql
             .query_get_value(
                 "SELECT id FROM contacts WHERE addr=? COLLATE NOCASE;",
-                paramsv![self.addr],
+                (&self.addr,),
             )
             .await?
             .with_context(|| format!("contact with peerstate.addr {:?} not found", &self.addr))?;
@@ -520,7 +554,7 @@ impl Peerstate {
                     .sql
                     .query_get_value(
                         "SELECT created_timestamp FROM chats WHERE id=?;",
-                        paramsv![chat_id],
+                        (chat_id,),
                     )
                     .await?
                     .unwrap_or(0)
@@ -542,14 +576,31 @@ impl Peerstate {
                 if (chat.typ == Chattype::Group && chat.is_protected())
                     || chat.typ == Chattype::Broadcast
                 {
-                    chat::remove_from_chat_contacts_table(context, *chat_id, contact_id).await?;
-
-                    let (new_contact_id, _) =
-                        Contact::add_or_lookup(context, "", new_addr, Origin::IncomingUnknownFrom)
+                    match ContactAddress::new(new_addr) {
+                        Ok(new_addr) => {
+                            let (new_contact_id, _) = Contact::add_or_lookup(
+                                context,
+                                "",
+                                new_addr,
+                                Origin::IncomingUnknownFrom,
+                            )
                             .await?;
-                    chat::add_to_chat_contacts_table(context, *chat_id, &[new_contact_id]).await?;
+                            chat::remove_from_chat_contacts_table(context, *chat_id, contact_id)
+                                .await?;
+                            chat::add_to_chat_contacts_table(context, *chat_id, &[new_contact_id])
+                                .await?;
 
-                    context.emit_event(EventType::ChatModified(*chat_id));
+                            context.emit_event(EventType::ChatModified(*chat_id));
+                        }
+                        Err(err) => {
+                            warn!(
+                                context,
+                                "New address {:?} is not valid, not doing AEAP: {:#}.",
+                                new_addr,
+                                err
+                            )
+                        }
+                    }
                 }
             }
 
@@ -587,7 +638,7 @@ impl Peerstate {
 /// AEAP stands for "Automatic Email Address Porting."
 ///
 /// In `drafts/aeap_mvp.md` there is a "big picture" overview over AEAP.
-pub async fn maybe_do_aeap_transition(
+pub(crate) async fn maybe_do_aeap_transition(
     context: &Context,
     mime_parser: &mut crate::mimeparser::MimeMessage,
 ) -> Result<()> {
@@ -637,6 +688,10 @@ pub async fn maybe_do_aeap_transition(
     Ok(())
 }
 
+/// Type of the peerstate change.
+///
+/// Changes to the peerstate are notified to the user via a message
+/// explaining the happened change.
 enum PeerstateChange {
     /// The contact's public key fingerprint changed, likely because
     /// the contact uses a new device and didn't transfer their key.
@@ -663,7 +718,7 @@ pub(crate) async fn deduplicate_peerstates(sql: &Sql) -> Result<()> {
          FROM acpeerstates
          GROUP BY addr
          )",
-        paramsv![],
+        (),
     )
     .await?;
 
@@ -796,7 +851,7 @@ mod tests {
         // can be loaded without errors.
         ctx.ctx
             .sql
-            .execute("INSERT INTO acpeerstates (addr) VALUES(?)", paramsv![addr])
+            .execute("INSERT INTO acpeerstates (addr) VALUES(?)", (addr,))
             .await
             .expect("Failed to write to the database");
 

@@ -308,7 +308,7 @@ async fn dkim_works_timestamp(context: &Context, from_domain: &str) -> Result<i6
         .sql
         .query_get_value(
             "SELECT dkim_works FROM sending_domains WHERE domain=?",
-            paramsv![from_domain],
+            (from_domain,),
         )
         .await?
         .unwrap_or(0);
@@ -325,7 +325,7 @@ async fn set_dkim_works_timestamp(
         .execute(
             "INSERT INTO sending_domains (domain, dkim_works) VALUES (?,?)
                 ON CONFLICT(domain) DO UPDATE SET dkim_works=excluded.dkim_works",
-            paramsv![from_domain, timestamp],
+            (from_domain, timestamp),
         )
         .await?;
     Ok(())
@@ -334,7 +334,7 @@ async fn set_dkim_works_timestamp(
 async fn clear_dkim_works(context: &Context) -> Result<()> {
     context
         .sql
-        .execute("DELETE FROM sending_domains", paramsv![])
+        .execute("DELETE FROM sending_domains", ())
         .await?;
     Ok(())
 }
@@ -355,7 +355,6 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     use super::*;
-
     use crate::aheader::EncryptPreference;
     use crate::e2ee;
     use crate::message;

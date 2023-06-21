@@ -1,4 +1,4 @@
-//! # Delta Chat Core Library.
+//! # Delta Chat Core Library
 
 #![recursion_limit = "256"]
 #![forbid(unsafe_code)]
@@ -12,10 +12,12 @@
     clippy::wildcard_imports,
     clippy::needless_borrow,
     clippy::cast_lossless,
-    clippy::unused_async
+    clippy::unused_async,
+    clippy::explicit_iter_loop,
+    clippy::explicit_into_iter_loop,
+    clippy::cloned_instead_of_copied
 )]
 #![allow(
-    clippy::uninlined_format_args,
     clippy::match_bool,
     clippy::mixed_read_write_in_expression,
     clippy::bool_assert_comparison,
@@ -32,11 +34,6 @@ extern crate smallvec;
 extern crate rusqlite;
 #[macro_use]
 extern crate strum_macros;
-
-#[allow(missing_docs)]
-pub trait ToSql: rusqlite::ToSql + Send + Sync {}
-
-impl<T: rusqlite::ToSql + Send + Sync> ToSql for T {}
 
 #[macro_use]
 pub mod log;
@@ -68,6 +65,7 @@ mod e2ee;
 pub mod ephemeral;
 mod imap;
 pub mod imex;
+pub mod release;
 mod scheduler;
 #[macro_use]
 mod job;
@@ -92,6 +90,7 @@ mod smtp;
 mod socks;
 pub mod stock_str;
 mod sync;
+mod timesmearing;
 mod token;
 mod update_helper;
 pub mod webxdc;
@@ -100,18 +99,18 @@ mod dehtml;
 mod authres;
 mod color;
 pub mod html;
-mod net;
+pub mod net;
 pub mod plaintext;
-mod ratelimit;
 pub mod summary;
 
+mod debug_logging;
 pub mod receive_imf;
 pub mod tools;
 
 pub mod accounts;
 pub mod reaction;
 
-/// if set imap/incoming and smtp/outgoing MIME messages will be printed
+/// If set IMAP/incoming and SMTP/outgoing MIME messages will be printed.
 pub const DCC_MIME_DEBUG: &str = "DCC_MIME_DEBUG";
 
 #[cfg(test)]

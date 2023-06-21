@@ -78,7 +78,7 @@ impl EncryptHelper {
                     };
                 }
                 None => {
-                    let msg = format!("peerstate for {:?} missing, cannot encrypt", addr);
+                    let msg = format!("peerstate for {addr:?} missing, cannot encrypt");
                     if e2ee_guaranteed {
                         return Err(format_err!("{}", msg));
                     } else {
@@ -112,7 +112,7 @@ impl EncryptHelper {
         {
             let key = peerstate
                 .take_key(min_verified)
-                .with_context(|| format!("proper enc-key for {} missing, cannot encrypt", addr))?;
+                .with_context(|| format!("proper enc-key for {addr} missing, cannot encrypt"))?;
             keyring.add(key);
         }
         keyring.add(self.public_key.clone());
@@ -123,6 +123,19 @@ impl EncryptHelper {
         let ctext = pgp::pk_encrypt(&raw_message, keyring, Some(sign_key)).await?;
 
         Ok(ctext)
+    }
+
+    /// Signs the passed-in `mail` using the private key from `context`.
+    /// Returns the payload and the signature.
+    pub async fn sign(
+        self,
+        context: &Context,
+        mail: lettre_email::PartBuilder,
+    ) -> Result<(lettre_email::MimeMessage, String)> {
+        let sign_key = SignedSecretKey::load_self(context).await?;
+        let mime_message = mail.build();
+        let signature = pgp::pk_calc_signature(mime_message.as_string().as_bytes(), &sign_key)?;
+        Ok((mime_message, signature))
     }
 }
 
@@ -144,12 +157,11 @@ pub async fn ensure_secret_key_exists(context: &Context) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::chat;
     use crate::message::{Message, Viewtype};
     use crate::param::Param;
     use crate::test_utils::{bob_keypair, TestContext};
-
-    use super::*;
 
     mod ensure_secret_key_exists {
         use super::*;

@@ -1,13 +1,15 @@
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ._utils import AttrDict
-from .rpc import Rpc
 
 if TYPE_CHECKING:
     from .account import Account
     from .chat import Chat
+    from .rpc import Rpc
 
 
+@dataclass
 class Contact:
     """
     Contact API.
@@ -15,23 +17,11 @@ class Contact:
     Essentially a wrapper for RPC, account ID and a contact ID.
     """
 
-    def __init__(self, account: "Account", contact_id: int) -> None:
-        self.account = account
-        self.id = contact_id
-
-    def __eq__(self, other) -> bool:
-        if not isinstance(other, Contact):
-            return False
-        return self.id == other.id and self.account == other.account
-
-    def __ne__(self, other) -> bool:
-        return not self == other
-
-    def __repr__(self) -> str:
-        return f"<Contact id={self.id} account={self.account.id}>"
+    account: "Account"
+    id: int
 
     @property
-    def _rpc(self) -> Rpc:
+    def _rpc(self) -> "Rpc":
         return self.account._rpc
 
     async def block(self) -> None:

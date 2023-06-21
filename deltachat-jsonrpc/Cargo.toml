@@ -1,6 +1,6 @@
 [package]
 name = "deltachat-jsonrpc"
-version = "1.104.0"
+version = "1.117.0"
 description = "DeltaChat JSON-RPC API"
 edition = "2021"
 default-run = "deltachat-jsonrpc-server"
@@ -15,26 +15,29 @@ required-features = ["webserver"]
 anyhow = "1"
 deltachat = { path = ".." }
 num-traits = "0.2"
+schemars = "0.8.11"
 serde = { version = "1.0", features = ["derive"] }
 tempfile = "3.3.0"
 log = "0.4"
 async-channel = { version = "1.8.0" }
-futures = { version = "0.3.25" }
-serde_json = "1.0.89"
-yerpc = { version = "^0.3.1", features = ["anyhow_expose"] }
+futures = { version = "0.3.28" }
+serde_json = "1.0.96"
+yerpc = { version = "0.5.1", features = ["anyhow_expose", "openrpc"] }
 typescript-type-def = { version = "0.5.5", features = ["json_value"] }
-tokio = { version = "1.23.0" }
+tokio = { version = "1.28.2" }
 sanitize-filename = "0.4"
-walkdir = "2.3.2"
+walkdir = "2.3.3"
+base64 = "0.21"
 
 # optional dependencies
-axum = { version = "0.6.1", optional = true, features = ["ws"] }
+axum = { version = "0.6.18", optional = true, features = ["ws"] }
 env_logger = { version = "0.10.0", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1.23.0", features = ["full", "rt-multi-thread"] }
+tokio = { version = "1.28.2", features = ["full", "rt-multi-thread"] }
 
 
 [features]
-default = []
-webserver = ["env_logger", "axum", "tokio/full", "yerpc/support-axum"]
+default = ["vendored"]
+webserver = ["dep:env_logger", "dep:axum", "tokio/full", "yerpc/support-axum"]
+vendored = ["deltachat/vendored"]

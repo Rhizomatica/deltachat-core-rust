@@ -102,8 +102,8 @@ def find_header(flags):
                     printf("%s", _dc_header_file_location());
                     return 0;
                 }
-            """
-                )
+            """,
+                ),
             )
         cwd = os.getcwd()
         try:
@@ -171,7 +171,7 @@ def extract_defines(flags):
             match = defines_re.match(line)
             if match:
                 defines.append(match.group(1))
-    return "\n".join("#define {} ...".format(d) for d in defines)
+    return "\n".join(f"#define {d} ..." for d in defines)
 
 
 def ffibuilder():
@@ -198,7 +198,7 @@ def ffibuilder():
         typedef int... time_t;
         void free(void *ptr);
         extern int dc_event_has_string_data(int);
-    """
+    """,
     )
     function_defs = extract_functions(flags)
     defines = extract_defines(flags)

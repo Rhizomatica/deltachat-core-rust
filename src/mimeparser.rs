@@ -1,13 +1,12 @@
 //! # MIME message parsing module.
 
-#![allow(missing_docs)]
-
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::str;
 
 use anyhow::{bail, Context as _, Result};
+use base64::Engine as _;
 use deltachat_derive::{FromSql, ToSql};
 use format_flowed::unformat_flowed;
 use lettre_email::mime::{self, Mime};
@@ -16,6 +15,7 @@ use once_cell::sync::Lazy;
 
 use crate::aheader::{Aheader, EncryptPreference};
 use crate::blob::BlobObject;
+use crate::config::Config;
 use crate::constants::{DC_DESIRED_TEXT_LINES, DC_DESIRED_TEXT_LINE_LEN};
 use crate::contact::{addr_cmp, addr_normalize, ContactId};
 use crate::context::Context;
@@ -34,7 +34,7 @@ use crate::peerstate::Peerstate;
 use crate::simplify::{simplify, SimplifiedText};
 use crate::stock_str;
 use crate::sync::SyncItems;
-use crate::tools::{get_filemeta, parse_receive_headers, truncate_by_lines};
+use crate::tools::{get_filemeta, parse_receive_headers, strip_rtlo_characters, truncate_by_lines};
 use crate::{location, tools};
 
 /// A parsed MIME message.
@@ -47,16 +47,24 @@ use crate::{location, tools};
 /// It is created by parsing the raw data of an actual MIME message
 /// using the [MimeMessage::from_bytes] constructor.
 #[derive(Debug)]
-pub struct MimeMessage {
+pub(crate) struct MimeMessage {
+    /// Parsed MIME parts.
     pub parts: Vec<Part>,
-    header: HashMap<String, String>,
+
+    /// Message headers.
+    headers: HashMap<String, String>,
 
     /// Addresses are normalized and lowercased:
     pub recipients: Vec<SingleInfo>,
+
+    /// `From:` address.
     pub from: SingleInfo,
+
     /// Whether the From address was repeated in the signed part
     /// (and we know that the signer intended to send from this address)
     pub from_is_signed: bool,
+    /// The List-Post address is only set for mailing lists. Users can send
+    /// messages to this address to post them to the list.
     pub list_post: Option<String>,
     pub chat_disposition_notification_to: Option<SingleInfo>,
     pub decryption_info: DecryptionInfo,
@@ -71,6 +79,8 @@ pub struct MimeMessage {
     /// The set of mail recipient addresses for which gossip headers were applied, regardless of
     /// whether they modified any peerstates.
     pub gossiped_addr: HashSet<String>,
+
+    /// True if the message is a forwarded message.
     pub is_forwarded: bool,
     pub is_system_message: SystemMessage,
     pub location_kml: Option<location::Kml>,
@@ -83,6 +93,9 @@ pub struct MimeMessage {
     pub(crate) delivery_report: Option<DeliveryReport>,
 
     /// Standard USENET signature, if any.
+    ///
+    /// `None` means no text part was received, empty string means a text part without a footer is
+    /// received.
     pub(crate) footer: Option<String>,
 
     // if this flag is set, the parts/text/etc. are just close to the original mime-message;
@@ -121,59 +134,70 @@ pub(crate) enum MailinglistType {
     None,
 }
 
+/// System message type.
 #[derive(
-    Debug, Display, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive, ToSql, FromSql,
+    Debug, Default, Display, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive, ToSql, FromSql,
 )]
 #[repr(u32)]
 pub enum SystemMessage {
+    /// Unknown type of system message.
+    #[default]
     Unknown = 0,
+
+    /// Group name changed.
     GroupNameChanged = 2,
+
+    /// Group avatar changed.
     GroupImageChanged = 3,
+
+    /// Member was added to the group.
     MemberAddedToGroup = 4,
+
+    /// Member was removed from the group.
     MemberRemovedFromGroup = 5,
+
+    /// Autocrypt Setup Message.
     AutocryptSetupMessage = 6,
+
+    /// Secure-join message.
     SecurejoinMessage = 7,
+
+    /// Location streaming is enabled.
     LocationStreamingEnabled = 8,
+
+    /// Location-only message.
     LocationOnly = 9,
 
     /// Chat ephemeral message timer is changed.
     EphemeralTimerChanged = 10,
 
-    // Chat protection state changed
+    /// Chat protection is enabled.
     ChatProtectionEnabled = 11,
+
+    /// Chat protection is disabled.
     ChatProtectionDisabled = 12,
 
     /// Self-sent-message that contains only json used for multi-device-sync;
     /// if possible, we attach that to other messages as for locations.
     MultiDeviceSync = 20,
 
-    // Sync message that contains a json payload
-    // sent to the other webxdc instances
-    // These messages are not shown in the chat.
+    /// Sync message that contains a json payload
+    /// sent to the other webxdc instances
+    /// These messages are not shown in the chat.
     WebxdcStatusUpdate = 30,
 
-    // Webxdc info added with `info` set in `send_webxdc_status_update()`.
+    /// Webxdc info added with `info` set in `send_webxdc_status_update()`.
     WebxdcInfoMessage = 32,
-}
-
-impl Default for SystemMessage {
-    fn default() -> Self {
-        SystemMessage::Unknown
-    }
 }
 
 const MIME_AC_SETUP_FILE: &str = "application/autocrypt-setup";
 
 impl MimeMessage {
-    pub async fn from_bytes(context: &Context, body: &[u8]) -> Result<Self> {
-        MimeMessage::from_bytes_with_partial(context, body, None).await
-    }
-
     /// Parse a mime message.
     ///
     /// If `partial` is set, it contains the full message size in bytes
     /// and `body` contains the header only.
-    pub(crate) async fn from_bytes_with_partial(
+    pub(crate) async fn from_bytes(
         context: &Context,
         body: &[u8],
         partial: Option<u32>,
@@ -206,8 +230,32 @@ impl MimeMessage {
 
         // Parse hidden headers.
         let mimetype = mail.ctype.mimetype.parse::<Mime>()?;
+        let (part, mimetype) =
+            if mimetype.type_() == mime::MULTIPART && mimetype.subtype().as_str() == "signed" {
+                if let Some(part) = mail.subparts.first() {
+                    // We don't remove "subject" from `headers` because currently just signed
+                    // messages are shown as unencrypted anyway.
+
+                    MimeMessage::merge_headers(
+                        context,
+                        &mut headers,
+                        &mut recipients,
+                        &mut from,
+                        &mut list_post,
+                        &mut chat_disposition_notification_to,
+                        &part.headers,
+                    );
+                    (part, part.ctype.mimetype.parse::<Mime>()?)
+                } else {
+                    // If it's a partially fetched message, there are no subparts.
+                    (&mail, mimetype)
+                }
+            } else {
+                // Currently we do not sign unencrypted messages by default.
+                (&mail, mimetype)
+            };
         if mimetype.type_() == mime::MULTIPART && mimetype.subtype().as_str() == "mixed" {
-            if let Some(part) = mail.subparts.first() {
+            if let Some(part) = part.subparts.first() {
                 for field in &part.headers {
                     let key = field.get_key().to_lowercase();
 
@@ -238,23 +286,27 @@ impl MimeMessage {
         hop_info += &decryption_info.dkim_results.to_string();
 
         let public_keyring = keyring_from_peerstate(decryption_info.peerstate.as_ref());
-        let (mail, mut signatures, encrypted) =
-            match try_decrypt(context, &mail, &private_keyring, &public_keyring) {
-                Ok(Some((raw, signatures))) => {
-                    mail_raw = raw;
-                    let decrypted_mail = mailparse::parse_mail(&mail_raw)?;
-                    if std::env::var(crate::DCC_MIME_DEBUG).is_ok() {
-                        info!(context, "decrypted message mime-body:");
-                        println!("{}", String::from_utf8_lossy(&mail_raw));
-                    }
-                    (Ok(decrypted_mail), signatures, true)
+        let (mail, mut signatures, encrypted) = match tokio::task::block_in_place(|| {
+            try_decrypt(context, &mail, &private_keyring, &public_keyring)
+        }) {
+            Ok(Some((raw, signatures))) => {
+                mail_raw = raw;
+                let decrypted_mail = mailparse::parse_mail(&mail_raw)?;
+                if std::env::var(crate::DCC_MIME_DEBUG).is_ok() {
+                    info!(
+                        context,
+                        "decrypted message mime-body:\n{}",
+                        String::from_utf8_lossy(&mail_raw),
+                    );
                 }
-                Ok(None) => (Ok(mail), HashSet::new(), false),
-                Err(err) => {
-                    warn!(context, "decryption failed: {}", err);
-                    (Err(err), HashSet::new(), false)
-                }
-            };
+                (Ok(decrypted_mail), signatures, true)
+            }
+            Ok(None) => (Ok(mail), HashSet::new(), false),
+            Err(err) => {
+                warn!(context, "decryption failed: {:#}", err);
+                (Err(err), HashSet::new(), false)
+            }
+        };
         let mail = mail.as_ref().map(|mail| {
             let (content, signatures_detached) = validate_detached_signature(mail, &public_keyring)
                 .unwrap_or((mail, Default::default()));
@@ -311,7 +363,7 @@ impl MimeMessage {
                     // where this would be useful.
                     warn!(
                         context,
-                        "From header in signed part does't match the outer one",
+                        "From header in signed part doesn't match the outer one",
                     );
                 }
             }
@@ -334,7 +386,7 @@ impl MimeMessage {
 
         let mut parser = MimeMessage {
             parts: Vec::new(),
-            header: headers,
+            headers,
             recipients,
             list_post,
             from,
@@ -374,13 +426,13 @@ impl MimeMessage {
                 }
                 Err(err) => {
                     let msg_body = stock_str::cant_decrypt_msg_body(context).await;
-                    let txt = format!("[{}]", msg_body);
+                    let txt = format!("[{msg_body}]");
 
                     let part = Part {
                         typ: Viewtype::Text,
                         msg_raw: Some(txt.clone()),
                         msg: txt,
-                        error: Some(format!("Decrypting failed: {}", err)),
+                        error: Some(format!("Decrypting failed: {err:#}")),
                         ..Default::default()
                     };
                     parser.parts.push(part);
@@ -479,7 +531,7 @@ impl MimeMessage {
         }
     }
 
-    /// Squashes mutlipart chat messages with attachment into single-part messages.
+    /// Squashes mutitpart chat messages with attachment into single-part messages.
     ///
     /// Delta Chat sends attachments, such as images, in two-part messages, with the first message
     /// containing a description. If such a message is detected, text from the first part can be
@@ -594,7 +646,7 @@ impl MimeMessage {
         }
 
         if self.is_forwarded {
-            for part in self.parts.iter_mut() {
+            for part in &mut self.parts {
                 part.param.set_int(Param::Forwarded, 1);
             }
         }
@@ -640,7 +692,7 @@ impl MimeMessage {
             self.parts.push(part);
         }
 
-        if self.header.contains_key("auto-submitted") {
+        if self.headers.contains_key("auto-submitted") {
             for part in &mut self.parts {
                 part.param.set(Param::Bot, "1");
             }
@@ -660,27 +712,27 @@ impl MimeMessage {
             .split_ascii_whitespace()
             .collect::<String>()
             .strip_prefix("base64:")
-            .map(base64::decode)
+            .map(|x| base64::engine::general_purpose::STANDARD.decode(x))
         {
             // Avatar sent directly in the header as base64.
             if let Ok(decoded_data) = avatar {
                 let extension = if let Ok(format) = image::guess_format(&decoded_data) {
                     if let Some(ext) = format.extensions_str().first() {
-                        format!(".{}", ext)
+                        format!(".{ext}")
                     } else {
                         String::new()
                     }
                 } else {
                     String::new()
                 };
-                match BlobObject::create(context, &format!("avatar{}", extension), &decoded_data)
+                match BlobObject::create(context, &format!("avatar{extension}"), &decoded_data)
                     .await
                 {
                     Ok(blob) => Some(AvatarAction::Change(blob.as_name().to_string())),
                     Err(err) => {
                         warn!(
                             context,
-                            "Could not save decoded avatar to blob file: {}", err
+                            "Could not save decoded avatar to blob file: {:#}", err
                         );
                         None
                     }
@@ -718,12 +770,10 @@ impl MimeMessage {
         !self.signatures.is_empty()
     }
 
+    /// Returns whether the email contains a `chat-version` header.
+    /// This indicates that the email is a DC-email.
     pub(crate) fn has_chat_version(&self) -> bool {
-        self.header.contains_key("chat-version")
-    }
-
-    pub(crate) fn has_headers(&self) -> bool {
-        !self.header.is_empty()
+        self.headers.contains_key("chat-version")
     }
 
     pub(crate) fn get_subject(&self) -> Option<String> {
@@ -733,7 +783,7 @@ impl MimeMessage {
     }
 
     pub fn get_header(&self, headerdef: HeaderDef) -> Option<&String> {
-        self.header.get(headerdef.get_headername())
+        self.headers.get(headerdef.get_headername())
     }
 
     fn parse_mime_recursive<'a>(
@@ -809,9 +859,9 @@ impl MimeMessage {
         let mut any_part_added = false;
         let mimetype = get_mime_type(mail)?.0;
         match (mimetype.type_(), mimetype.subtype().as_str()) {
-            /* Most times, mutlipart/alternative contains true alternatives
+            /* Most times, multipart/alternative contains true alternatives
             as text/plain and text/html.  If we find a multipart/mixed
-            inside mutlipart/alternative, we use this (happens eg in
+            inside multipart/alternative, we use this (happens eg in
             apple mail: "plaintext" as an alternative to "html+PDF attachment") */
             (mime::MULTIPART, "alternative") => {
                 for cur_data in &mail.subparts {
@@ -897,7 +947,7 @@ impl MimeMessage {
                             }
 
                             // Add all parts (we need another part, preferably text/plain, to show as an error message)
-                            for cur_data in mail.subparts.iter() {
+                            for cur_data in &mail.subparts {
                                 if self
                                     .parse_mime_recursive(context, cur_data, is_related)
                                     .await?
@@ -931,7 +981,7 @@ impl MimeMessage {
             _ => {
                 // Add all parts (in fact, AddSinglePartIfKnown() later check if
                 // the parts are really supported)
-                for cur_data in mail.subparts.iter() {
+                for cur_data in &mail.subparts {
                     if self
                         .parse_mime_recursive(context, cur_data, is_related)
                         .await?
@@ -987,7 +1037,7 @@ impl MimeMessage {
                         let decoded_data = match mail.get_body() {
                             Ok(decoded_data) => decoded_data,
                             Err(err) => {
-                                warn!(context, "Invalid body parsed {:?}", err);
+                                warn!(context, "Invalid body parsed {:#}", err);
                                 // Note that it's not always an error - might be no data
                                 return Ok(false);
                             }
@@ -1007,12 +1057,13 @@ impl MimeMessage {
                         let decoded_data = match mail.get_body() {
                             Ok(decoded_data) => decoded_data,
                             Err(err) => {
-                                warn!(context, "Invalid body parsed {:?}", err);
+                                warn!(context, "Invalid body parsed {:#}", err);
                                 // Note that it's not always an error - might be no data
                                 return Ok(false);
                             }
                         };
 
+                        let is_plaintext = mime_type == mime::TEXT_PLAIN;
                         let mut dehtml_failed = false;
 
                         let SimplifiedText {
@@ -1064,15 +1115,22 @@ impl MimeMessage {
                             (simplified_txt, top_quote)
                         };
 
-                        // Truncate text if it has too many lines
-                        let (simplified_txt, was_truncated) = truncate_by_lines(
-                            simplified_txt,
-                            DC_DESIRED_TEXT_LINES,
-                            DC_DESIRED_TEXT_LINE_LEN,
-                        );
-                        if was_truncated {
-                            self.is_mime_modified = was_truncated;
-                        }
+                        let is_bot = context.get_config_bool(Config::Bot).await?;
+
+                        let simplified_txt = if is_bot {
+                            simplified_txt
+                        } else {
+                            // Truncate text if it has too many lines
+                            let (simplified_txt, was_truncated) = truncate_by_lines(
+                                simplified_txt,
+                                DC_DESIRED_TEXT_LINES,
+                                DC_DESIRED_TEXT_LINE_LEN,
+                            );
+                            if was_truncated {
+                                self.is_mime_modified = was_truncated;
+                            }
+                            simplified_txt
+                        };
 
                         if !simplified_txt.is_empty() || simplified_quote.is_some() {
                             let mut part = Part {
@@ -1093,7 +1151,9 @@ impl MimeMessage {
                             self.is_forwarded = true;
                         }
 
-                        self.footer = footer;
+                        if self.footer.is_none() && is_plaintext {
+                            self.footer = Some(footer.unwrap_or_default());
+                        }
                     }
                     _ => {}
                 }
@@ -1139,7 +1199,7 @@ impl MimeMessage {
             if filename.starts_with("location") || filename.starts_with("message") {
                 let parsed = location::Kml::parse(decoded_data)
                     .map_err(|err| {
-                        warn!(context, "failed to parse kml part: {}", err);
+                        warn!(context, "failed to parse kml part: {:#}", err);
                     })
                     .ok();
                 if filename.starts_with("location") {
@@ -1157,7 +1217,7 @@ impl MimeMessage {
             self.sync_items = context
                 .parse_sync_items(serialized)
                 .map_err(|err| {
-                    warn!(context, "failed to parse sync data: {}", err);
+                    warn!(context, "failed to parse sync data: {:#}", err);
                 })
                 .ok();
             return Ok(());
@@ -1179,7 +1239,7 @@ impl MimeMessage {
             Err(err) => {
                 error!(
                     context,
-                    "Could not add blob for mime part {}, error {}", filename, err
+                    "Could not add blob for mime part {}, error {:#}", filename, err
                 );
                 return Ok(());
             }
@@ -1224,7 +1284,7 @@ impl MimeMessage {
             Err(err) => {
                 warn!(
                     context,
-                    "PGP key attachment is not an ASCII-armored file: {}", err,
+                    "PGP key attachment is not an ASCII-armored file: {:#}", err
                 );
                 return Ok(false);
             }
@@ -1237,7 +1297,7 @@ impl MimeMessage {
         if !key.details.users.iter().any(|user| {
             user.id
                 .id()
-                .ends_with(&(String::from("<") + &peerstate.addr + ">"))
+                .ends_with((String::from("<") + &peerstate.addr + ">").as_bytes())
         }) {
             return Ok(false);
         }
@@ -1299,7 +1359,7 @@ impl MimeMessage {
         self.is_system_message = SystemMessage::Unknown;
         if let Some(part) = self.parts.first_mut() {
             part.typ = Viewtype::Text;
-            part.msg = format!("[{}]", error_msg);
+            part.msg = format!("[{error_msg}]");
             self.parts.truncate(1);
         }
     }
@@ -1622,10 +1682,7 @@ impl MimeMessage {
         {
             context
                 .sql
-                .query_get_value(
-                    "SELECT timestamp FROM msgs WHERE rfc724_mid=?",
-                    paramsv![field],
-                )
+                .query_get_value("SELECT timestamp FROM msgs WHERE rfc724_mid=?", (field,))
                 .await?
         } else {
             None
@@ -1636,7 +1693,7 @@ impl MimeMessage {
 
 /// Parses `Autocrypt-Gossip` headers from the email and applies them to peerstates.
 /// Params:
-/// from: The address which sent the message currently beeing parsed
+/// from: The address which sent the message currently being parsed
 ///
 /// Returns the set of mail recipient addresses for which valid gossip headers were found.
 async fn update_gossip_peerstates(
@@ -1691,7 +1748,7 @@ async fn update_gossip_peerstates(
             .handle_fingerprint_change(context, message_time)
             .await?;
 
-        gossiped_addr.insert(header.addr.clone());
+        gossiped_addr.insert(header.addr.to_lowercase());
     }
 
     Ok(gossiped_addr)
@@ -1762,16 +1819,34 @@ fn is_known(key: &str) -> bool {
     )
 }
 
+/// Parsed MIME part.
 #[derive(Debug, Default, Clone)]
 pub struct Part {
+    /// Type of the MIME part determining how it should be displayed.
     pub typ: Viewtype,
+
+    /// MIME type.
     pub mimetype: Option<Mime>,
+
+    /// Message text to be displayed in the chat.
     pub msg: String,
+
+    /// Message text to be displayed in message info.
     pub msg_raw: Option<String>,
+
+    /// Size of the MIME part in bytes.
     pub bytes: usize,
+
+    /// Parameters.
     pub param: Params,
+
+    /// Attachment filename.
     pub(crate) org_filename: Option<String>,
+
+    /// An error detected during parsing.
     pub error: Option<String>,
+
+    /// True if conversion from HTML to plaintext failed.
     pub(crate) dehtml_failed: bool,
 
     /// the part is a child or a descendant of multipart/related.
@@ -1879,7 +1954,7 @@ fn get_attachment_filename(
     // If there is no filename, but part is an attachment, guess filename
     if desired_filename.is_none() && ct.disposition == DispositionType::Attachment {
         if let Some(subtype) = mail.ctype.mimetype.split('/').nth(1) {
-            desired_filename = Some(format!("file.{}", subtype,));
+            desired_filename = Some(format!("file.{subtype}",));
         } else {
             bail!(
                 "could not determine attachment filename: {:?}",
@@ -1887,6 +1962,8 @@ fn get_attachment_filename(
             );
         };
     }
+
+    let desired_filename = desired_filename.map(|filename| strip_rtlo_characters(&filename));
 
     Ok(desired_filename)
 }
@@ -1912,10 +1989,10 @@ pub(crate) fn get_list_post(headers: &[MailHeader]) -> Option<String> {
         .map(|s| s.addr)
 }
 
-fn get_all_addresses_from_header<F>(headers: &[MailHeader], pred: F) -> Vec<SingleInfo>
-where
-    F: Fn(String) -> bool,
-{
+fn get_all_addresses_from_header(
+    headers: &[MailHeader],
+    pred: fn(String) -> bool,
+) -> Vec<SingleInfo> {
     let mut result: Vec<SingleInfo> = Default::default();
 
     headers
@@ -1950,16 +2027,16 @@ where
 mod tests {
     #![allow(clippy::indexing_slicing)]
 
+    use mailparse::ParsedMail;
+
     use super::*;
     use crate::{
         chatlist::Chatlist,
-        config::Config,
         constants::{Blocked, DC_DESIRED_TEXT_LEN, DC_ELLIPSIS},
         message::{Message, MessageState, MessengerMessage},
         receive_imf::receive_imf,
         test_utils::TestContext,
     };
-    use mailparse::ParsedMail;
 
     impl AvatarAction {
         pub fn is_change(&self) -> bool {
@@ -1974,35 +2051,35 @@ mod tests {
     async fn test_mimeparser_fromheader() {
         let ctx = TestContext::new_alice().await;
 
-        let mimemsg = MimeMessage::from_bytes(&ctx, b"From: g@c.de\n\nhi")
+        let mimemsg = MimeMessage::from_bytes(&ctx, b"From: g@c.de\n\nhi", None)
             .await
             .unwrap();
         let contact = mimemsg.from;
         assert_eq!(contact.addr, "g@c.de");
         assert_eq!(contact.display_name, None);
 
-        let mimemsg = MimeMessage::from_bytes(&ctx, b"From:   g@c.de  \n\nhi")
+        let mimemsg = MimeMessage::from_bytes(&ctx, b"From:   g@c.de  \n\nhi", None)
             .await
             .unwrap();
         let contact = mimemsg.from;
         assert_eq!(contact.addr, "g@c.de");
         assert_eq!(contact.display_name, None);
 
-        let mimemsg = MimeMessage::from_bytes(&ctx, b"From: <g@c.de>\n\nhi")
+        let mimemsg = MimeMessage::from_bytes(&ctx, b"From: <g@c.de>\n\nhi", None)
             .await
             .unwrap();
         let contact = mimemsg.from;
         assert_eq!(contact.addr, "g@c.de");
         assert_eq!(contact.display_name, None);
 
-        let mimemsg = MimeMessage::from_bytes(&ctx, b"From: Goetz C <g@c.de>\n\nhi")
+        let mimemsg = MimeMessage::from_bytes(&ctx, b"From: Goetz C <g@c.de>\n\nhi", None)
             .await
             .unwrap();
         let contact = mimemsg.from;
         assert_eq!(contact.addr, "g@c.de");
         assert_eq!(contact.display_name, Some("Goetz C".to_string()));
 
-        let mimemsg = MimeMessage::from_bytes(&ctx, b"From: \"Goetz C\" <g@c.de>\n\nhi")
+        let mimemsg = MimeMessage::from_bytes(&ctx, b"From: \"Goetz C\" <g@c.de>\n\nhi", None)
             .await
             .unwrap();
         let contact = mimemsg.from;
@@ -2010,7 +2087,7 @@ mod tests {
         assert_eq!(contact.display_name, Some("Goetz C".to_string()));
 
         let mimemsg =
-            MimeMessage::from_bytes(&ctx, b"From: =?utf-8?q?G=C3=B6tz?= C <g@c.de>\n\nhi")
+            MimeMessage::from_bytes(&ctx, b"From: =?utf-8?q?G=C3=B6tz?= C <g@c.de>\n\nhi", None)
                 .await
                 .unwrap();
         let contact = mimemsg.from;
@@ -2019,10 +2096,13 @@ mod tests {
 
         // although RFC 2047 says, encoded-words shall not appear inside quoted-string,
         // this combination is used in the wild eg. by MailMate
-        let mimemsg =
-            MimeMessage::from_bytes(&ctx, b"From: \"=?utf-8?q?G=C3=B6tz?= C\" <g@c.de>\n\nhi")
-                .await
-                .unwrap();
+        let mimemsg = MimeMessage::from_bytes(
+            &ctx,
+            b"From: \"=?utf-8?q?G=C3=B6tz?= C\" <g@c.de>\n\nhi",
+            None,
+        )
+        .await
+        .unwrap();
         let contact = mimemsg.from;
         assert_eq!(contact.addr, "g@c.de");
         assert_eq!(contact.display_name, Some("Götz C".to_string()));
@@ -2032,7 +2112,7 @@ mod tests {
     async fn test_mimeparser_crash() {
         let context = TestContext::new_alice().await;
         let raw = include_bytes!("../test-data/message/issue_523.txt");
-        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..])
+        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..], None)
             .await
             .unwrap();
 
@@ -2044,7 +2124,7 @@ mod tests {
     async fn test_get_rfc724_mid_exists() {
         let context = TestContext::new_alice().await;
         let raw = include_bytes!("../test-data/message/mail_with_message_id.txt");
-        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..])
+        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..], None)
             .await
             .unwrap();
 
@@ -2058,7 +2138,7 @@ mod tests {
     async fn test_get_rfc724_mid_not_exists() {
         let context = TestContext::new_alice().await;
         let raw = include_bytes!("../test-data/message/issue_523.txt");
-        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..])
+        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..], None)
             .await
             .unwrap();
         assert_eq!(mimeparser.get_rfc724_mid(), None);
@@ -2255,7 +2335,7 @@ mod tests {
                     test1\n\
                     ";
 
-        let mimeparser = MimeMessage::from_bytes_with_partial(&context.ctx, &raw[..], None).await;
+        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..], None).await;
 
         assert!(mimeparser.is_err());
     }
@@ -2270,7 +2350,7 @@ mod tests {
                     \n\
                     Some reply\n\
                     ";
-        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..])
+        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..], None)
             .await
             .unwrap();
         assert_eq!(
@@ -2283,7 +2363,7 @@ mod tests {
             .sql
             .execute(
                 "INSERT INTO msgs (rfc724_mid, timestamp) VALUES(?,?)",
-                paramsv!["Gr.beZgAF2Nn0-.oyaJOpeuT70@example.org", timestamp],
+                ("Gr.beZgAF2Nn0-.oyaJOpeuT70@example.org", timestamp),
             )
             .await
             .expect("Failed to write to the database");
@@ -2316,7 +2396,7 @@ mod tests {
                     --==break==--\n\
                     \n";
 
-        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..])
+        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..], None)
             .await
             .unwrap();
 
@@ -2325,7 +2405,7 @@ mod tests {
         assert_eq!(of, "no");
 
         // unknown headers do not bubble upwards
-        let of = mimeparser.get_header(HeaderDef::_TestHeader).unwrap();
+        let of = mimeparser.get_header(HeaderDef::TestHeader).unwrap();
         assert_eq!(of, "Bar");
 
         // the following fields would bubble up
@@ -2350,26 +2430,26 @@ mod tests {
         let t = TestContext::new_alice().await;
 
         let raw = include_bytes!("../test-data/message/mail_attach_txt.eml");
-        let mimeparser = MimeMessage::from_bytes(&t, &raw[..]).await.unwrap();
+        let mimeparser = MimeMessage::from_bytes(&t, &raw[..], None).await.unwrap();
         assert_eq!(mimeparser.user_avatar, None);
         assert_eq!(mimeparser.group_avatar, None);
 
         let raw = include_bytes!("../test-data/message/mail_with_user_avatar.eml");
-        let mimeparser = MimeMessage::from_bytes(&t, &raw[..]).await.unwrap();
+        let mimeparser = MimeMessage::from_bytes(&t, &raw[..], None).await.unwrap();
         assert_eq!(mimeparser.parts.len(), 1);
         assert_eq!(mimeparser.parts[0].typ, Viewtype::Text);
         assert!(mimeparser.user_avatar.unwrap().is_change());
         assert_eq!(mimeparser.group_avatar, None);
 
         let raw = include_bytes!("../test-data/message/mail_with_user_avatar_deleted.eml");
-        let mimeparser = MimeMessage::from_bytes(&t, &raw[..]).await.unwrap();
+        let mimeparser = MimeMessage::from_bytes(&t, &raw[..], None).await.unwrap();
         assert_eq!(mimeparser.parts.len(), 1);
         assert_eq!(mimeparser.parts[0].typ, Viewtype::Text);
         assert_eq!(mimeparser.user_avatar, Some(AvatarAction::Delete));
         assert_eq!(mimeparser.group_avatar, None);
 
         let raw = include_bytes!("../test-data/message/mail_with_user_and_group_avatars.eml");
-        let mimeparser = MimeMessage::from_bytes(&t, &raw[..]).await.unwrap();
+        let mimeparser = MimeMessage::from_bytes(&t, &raw[..], None).await.unwrap();
         assert_eq!(mimeparser.parts.len(), 1);
         assert_eq!(mimeparser.parts[0].typ, Viewtype::Text);
         assert!(mimeparser.user_avatar.unwrap().is_change());
@@ -2379,7 +2459,9 @@ mod tests {
         let raw = include_bytes!("../test-data/message/mail_with_user_and_group_avatars.eml");
         let raw = String::from_utf8_lossy(raw).to_string();
         let raw = raw.replace("Chat-User-Avatar:", "Xhat-Xser-Xvatar:");
-        let mimeparser = MimeMessage::from_bytes(&t, raw.as_bytes()).await.unwrap();
+        let mimeparser = MimeMessage::from_bytes(&t, raw.as_bytes(), None)
+            .await
+            .unwrap();
         assert_eq!(mimeparser.parts.len(), 1);
         assert_eq!(mimeparser.parts[0].typ, Viewtype::Image);
         assert_eq!(mimeparser.user_avatar, None);
@@ -2391,7 +2473,7 @@ mod tests {
         let t = TestContext::new_alice().await;
 
         let raw = include_bytes!("../test-data/message/videochat_invitation.eml");
-        let mimeparser = MimeMessage::from_bytes(&t, &raw[..]).await.unwrap();
+        let mimeparser = MimeMessage::from_bytes(&t, &raw[..], None).await.unwrap();
         assert_eq!(mimeparser.parts.len(), 1);
         assert_eq!(mimeparser.parts[0].typ, Viewtype::VideochatInvitation);
         assert_eq!(
@@ -2438,7 +2520,7 @@ Content-Disposition: attachment; filename=\"message.kml\"\n\
 --==break==--\n\
 ;";
 
-        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..])
+        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..], None)
             .await
             .unwrap();
         assert_eq!(
@@ -2487,7 +2569,7 @@ Disposition: manual-action/MDN-sent-automatically; displayed\n\
 --kJBbU58X1xeWNHgBtTbMk80M5qnV4N--\n\
 ";
 
-        let message = MimeMessage::from_bytes(&context.ctx, &raw[..])
+        let message = MimeMessage::from_bytes(&context.ctx, &raw[..], None)
             .await
             .unwrap();
         assert_eq!(
@@ -2567,7 +2649,7 @@ Disposition: manual-action/MDN-sent-automatically; displayed\n\
 --outer--\n\
 ";
 
-        let message = MimeMessage::from_bytes(&context.ctx, &raw[..])
+        let message = MimeMessage::from_bytes(&context.ctx, &raw[..], None)
             .await
             .unwrap();
         assert_eq!(
@@ -2614,7 +2696,7 @@ Additional-Message-IDs: <foo@example.com> <foo@example.net>\n\
 --kJBbU58X1xeWNHgBtTbMk80M5qnV4N--\n\
 ";
 
-        let message = MimeMessage::from_bytes(&context.ctx, &raw[..])
+        let message = MimeMessage::from_bytes(&context.ctx, &raw[..], None)
             .await
             .unwrap();
         assert_eq!(
@@ -2661,7 +2743,7 @@ MDYyMDYxNTE1RTlDOEE4Cj4+CnN0YXJ0eHJlZgo4Mjc4CiUlRU9GCg==
 ------=_Part_25_46172632.1581201680436--
 "#;
 
-        let message = MimeMessage::from_bytes(&context.ctx, &raw[..])
+        let message = MimeMessage::from_bytes(&context.ctx, &raw[..], None)
             .await
             .unwrap();
         assert_eq!(
@@ -2705,7 +2787,7 @@ MDYyMDYxNTE1RTlDOEE4Cj4+CnN0YXJ0eHJlZgo4Mjc4CiUlRU9GCg==
 ------=_Part_25_46172632.1581201680436--
 "#;
 
-        let message = MimeMessage::from_bytes(&t, &raw[..]).await.unwrap();
+        let message = MimeMessage::from_bytes(&t, &raw[..], None).await.unwrap();
 
         assert_eq!(message.parts.len(), 1);
         assert_eq!(message.parts[0].typ, Viewtype::File);
@@ -2759,7 +2841,7 @@ CWt6wx7fiLp0qS9RrX75g6Gqw7nfCs6EcBERcIPt7DTe8VStJwf3LWqVwxl4gQl46yhfoqwEO+I=
 ----11019878869865180--
 "#;
 
-        let message = MimeMessage::from_bytes(&context.ctx, &raw[..])
+        let message = MimeMessage::from_bytes(&context.ctx, &raw[..], None)
             .await
             .unwrap();
         assert_eq!(message.get_subject(), Some("example".to_string()));
@@ -2831,7 +2913,7 @@ CWt6wx7fiLp0qS9RrX75g6Gqw7nfCs6EcBERcIPt7DTe8VStJwf3LWqVwxl4gQl46yhfoqwEO+I=
 
 --------------779C1631600DF3DB8C02E53A--"#;
 
-        let message = MimeMessage::from_bytes(&context.ctx, &raw[..])
+        let message = MimeMessage::from_bytes(&context.ctx, &raw[..], None)
             .await
             .unwrap();
         assert_eq!(message.get_subject(), Some("Test subject".to_string()));
@@ -2902,7 +2984,7 @@ CWt6wx7fiLp0qS9RrX75g6Gqw7nfCs6EcBERcIPt7DTe8VStJwf3LWqVwxl4gQl46yhfoqwEO+I=
 ------=_NextPart_000_0003_01D622B3.CA753E60--
 "##;
 
-        let message = MimeMessage::from_bytes(&context.ctx, &raw[..])
+        let message = MimeMessage::from_bytes(&context.ctx, &raw[..], None)
             .await
             .unwrap();
         assert_eq!(
@@ -3000,7 +3082,7 @@ From: alice <alice@example.org>
 Reply
 "##;
 
-        let message = MimeMessage::from_bytes(&context.ctx, &raw[..])
+        let message = MimeMessage::from_bytes(&context.ctx, &raw[..], None)
             .await
             .unwrap();
         assert_eq!(
@@ -3032,7 +3114,7 @@ From: alice <alice@example.org>
 > Just a quote.
 "##;
 
-        let message = MimeMessage::from_bytes(&context.ctx, &raw[..])
+        let message = MimeMessage::from_bytes(&context.ctx, &raw[..], None)
             .await
             .unwrap();
         assert_eq!(
@@ -3066,7 +3148,7 @@ On 2020-10-25, Bob wrote:
 > A quote.
 "##;
 
-        let message = MimeMessage::from_bytes(&context.ctx, &raw[..])
+        let message = MimeMessage::from_bytes(&context.ctx, &raw[..], None)
             .await
             .unwrap();
         assert_eq!(message.get_subject(), Some("Re: top posting".to_string()));
@@ -3084,7 +3166,7 @@ On 2020-10-25, Bob wrote:
     async fn test_attachment_quote() {
         let context = TestContext::new_alice().await;
         let raw = include_bytes!("../test-data/message/quote_attach.eml");
-        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..])
+        let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..], None)
             .await
             .unwrap();
 
@@ -3102,7 +3184,7 @@ On 2020-10-25, Bob wrote:
     async fn test_quote_div() {
         let t = TestContext::new_alice().await;
         let raw = include_bytes!("../test-data/message/gmx-quote.eml");
-        let mimeparser = MimeMessage::from_bytes(&t, raw).await.unwrap();
+        let mimeparser = MimeMessage::from_bytes(&t, raw, None).await.unwrap();
         assert_eq!(mimeparser.parts[0].msg, "YIPPEEEEEE\n\nMulti-line");
         assert_eq!(mimeparser.parts[0].param.get(Param::Quote).unwrap(), "Now?");
     }
@@ -3112,7 +3194,7 @@ On 2020-10-25, Bob wrote:
         // all-inkl.com puts quotes into `<blockquote> </blockquote>`.
         let t = TestContext::new_alice().await;
         let raw = include_bytes!("../test-data/message/allinkl-quote.eml");
-        let mimeparser = MimeMessage::from_bytes(&t, raw).await.unwrap();
+        let mimeparser = MimeMessage::from_bytes(&t, raw, None).await.unwrap();
         assert!(mimeparser.parts[0].msg.starts_with("It's 1.0."));
         assert_eq!(
             mimeparser.parts[0].param.get(Param::Quote).unwrap(),
@@ -3123,7 +3205,6 @@ On 2020-10-25, Bob wrote:
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_add_subj_to_multimedia_msg() {
         let t = TestContext::new_alice().await;
-        t.set_config(Config::ShowEmails, Some("2")).await.unwrap();
         receive_imf(
             &t.ctx,
             include_bytes!("../test-data/message/subj_with_multimedia_msg.eml"),
@@ -3145,7 +3226,7 @@ On 2020-10-25, Bob wrote:
         assert_eq!(msg.is_dc_message, MessengerMessage::No);
         assert_eq!(msg.chat_blocked, Blocked::Request);
         assert_eq!(msg.state, MessageState::InFresh);
-        assert_eq!(msg.get_filebytes(&t).await, 2115);
+        assert_eq!(msg.get_filebytes(&t).await.unwrap().unwrap(), 2115);
         assert!(msg.get_file(&t).is_some());
         assert_eq!(msg.get_filename().unwrap(), "avatar64x64.png");
         assert_eq!(msg.get_width(), 64);
@@ -3157,7 +3238,7 @@ On 2020-10-25, Bob wrote:
     async fn test_mime_modified_plain() {
         let t = TestContext::new_alice().await;
         let raw = include_bytes!("../test-data/message/text_plain_unspecified.eml");
-        let mimeparser = MimeMessage::from_bytes(&t.ctx, raw).await.unwrap();
+        let mimeparser = MimeMessage::from_bytes(&t.ctx, raw, None).await.unwrap();
         assert!(!mimeparser.is_mime_modified);
         assert_eq!(
             mimeparser.parts[0].msg,
@@ -3169,7 +3250,7 @@ On 2020-10-25, Bob wrote:
     async fn test_mime_modified_alt_plain_html() {
         let t = TestContext::new_alice().await;
         let raw = include_bytes!("../test-data/message/text_alt_plain_html.eml");
-        let mimeparser = MimeMessage::from_bytes(&t.ctx, raw).await.unwrap();
+        let mimeparser = MimeMessage::from_bytes(&t.ctx, raw, None).await.unwrap();
         assert!(mimeparser.is_mime_modified);
         assert_eq!(
             mimeparser.parts[0].msg,
@@ -3181,7 +3262,7 @@ On 2020-10-25, Bob wrote:
     async fn test_mime_modified_alt_plain() {
         let t = TestContext::new_alice().await;
         let raw = include_bytes!("../test-data/message/text_alt_plain.eml");
-        let mimeparser = MimeMessage::from_bytes(&t.ctx, raw).await.unwrap();
+        let mimeparser = MimeMessage::from_bytes(&t.ctx, raw, None).await.unwrap();
         assert!(!mimeparser.is_mime_modified);
         assert_eq!(
             mimeparser.parts[0].msg,
@@ -3196,7 +3277,7 @@ On 2020-10-25, Bob wrote:
     async fn test_mime_modified_alt_html() {
         let t = TestContext::new_alice().await;
         let raw = include_bytes!("../test-data/message/text_alt_html.eml");
-        let mimeparser = MimeMessage::from_bytes(&t.ctx, raw).await.unwrap();
+        let mimeparser = MimeMessage::from_bytes(&t.ctx, raw, None).await.unwrap();
         assert!(mimeparser.is_mime_modified);
         assert_eq!(
             mimeparser.parts[0].msg,
@@ -3208,7 +3289,7 @@ On 2020-10-25, Bob wrote:
     async fn test_mime_modified_html() {
         let t = TestContext::new_alice().await;
         let raw = include_bytes!("../test-data/message/text_html.eml");
-        let mimeparser = MimeMessage::from_bytes(&t.ctx, raw).await.unwrap();
+        let mimeparser = MimeMessage::from_bytes(&t.ctx, raw, None).await.unwrap();
         assert!(mimeparser.is_mime_modified);
         assert_eq!(
             mimeparser.parts[0].msg,
@@ -3217,24 +3298,37 @@ On 2020-10-25, Bob wrote:
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_mime_modified_large_plain() {
+    async fn test_mime_modified_large_plain() -> Result<()> {
         let t = TestContext::new_alice().await;
 
         static REPEAT_TXT: &str = "this text with 42 chars is just repeated.\n";
         static REPEAT_CNT: usize = 2000; // results in a text of 84k, should be more than DC_DESIRED_TEXT_LEN
         let long_txt = format!("From: alice@c.de\n\n{}", REPEAT_TXT.repeat(REPEAT_CNT));
-
-        let mimemsg = MimeMessage::from_bytes(&t, long_txt.as_ref())
-            .await
-            .unwrap();
         assert_eq!(long_txt.matches("just repeated").count(), REPEAT_CNT);
         assert!(long_txt.len() > DC_DESIRED_TEXT_LEN);
-        assert!(mimemsg.is_mime_modified);
-        assert!(
-            mimemsg.parts[0].msg.matches("just repeated").count()
-                <= DC_DESIRED_TEXT_LEN / REPEAT_TXT.len()
-        );
-        assert!(mimemsg.parts[0].msg.len() <= DC_DESIRED_TEXT_LEN + DC_ELLIPSIS.len());
+
+        {
+            let mimemsg = MimeMessage::from_bytes(&t, long_txt.as_ref(), None).await?;
+            assert!(mimemsg.is_mime_modified);
+            assert!(
+                mimemsg.parts[0].msg.matches("just repeated").count()
+                    <= DC_DESIRED_TEXT_LEN / REPEAT_TXT.len()
+            );
+            assert!(mimemsg.parts[0].msg.len() <= DC_DESIRED_TEXT_LEN + DC_ELLIPSIS.len());
+        }
+
+        t.set_config(Config::Bot, Some("1")).await?;
+
+        {
+            let mimemsg = MimeMessage::from_bytes(&t, long_txt.as_ref(), None).await?;
+            assert!(!mimemsg.is_mime_modified);
+            assert_eq!(
+                format!("{}\n", mimemsg.parts[0].msg),
+                REPEAT_TXT.repeat(REPEAT_CNT)
+            );
+        }
+
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3251,7 +3345,7 @@ On 2020-10-25, Bob wrote:
                 MIME-Version: 1.0\n\
                 \n\
                 Does it work with outlook now?\n\
-                ")
+                ", None)
             .await
             .unwrap();
         assert_eq!(
@@ -3407,7 +3501,6 @@ Message.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_ms_exchange_mdn() -> Result<()> {
         let t = TestContext::new_alice().await;
-        t.set_config(Config::ShowEmails, Some("2")).await?;
 
         let original =
             include_bytes!("../test-data/message/ms_exchange_report_original_message.eml");
@@ -3417,7 +3510,7 @@ Message.
         // 1. Test mimeparser directly
         let mdn =
             include_bytes!("../test-data/message/ms_exchange_report_disposition_notification.eml");
-        let mimeparser = MimeMessage::from_bytes(&t.ctx, mdn).await?;
+        let mimeparser = MimeMessage::from_bytes(&t.ctx, mdn, None).await?;
         assert_eq!(mimeparser.mdn_reports.len(), 1);
         assert_eq!(
             mimeparser.mdn_reports[0].original_message_id.as_deref(),
@@ -3443,6 +3536,7 @@ Message.
         let mime_message = MimeMessage::from_bytes(
             &alice,
             include_bytes!("../test-data/message/attached-eml.eml"),
+            None,
         )
         .await?;
 
@@ -3485,6 +3579,7 @@ Content-Disposition: reaction\n\
 \n\
 \u{1F44D}"
                 .as_bytes(),
+            None,
         )
         .await?;
 

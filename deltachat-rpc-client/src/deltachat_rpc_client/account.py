@@ -1,37 +1,28 @@
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from warnings import warn
 
 from ._utils import AttrDict
 from .chat import Chat
 from .const import ChatlistFlag, ContactFlag, SpecialContactId
 from .contact import Contact
 from .message import Message
-from .rpc import Rpc
 
 if TYPE_CHECKING:
     from .deltachat import DeltaChat
+    from .rpc import Rpc
 
 
+@dataclass
 class Account:
     """Delta Chat account."""
 
-    def __init__(self, manager: "DeltaChat", account_id: int) -> None:
-        self.manager = manager
-        self.id = account_id
+    manager: "DeltaChat"
+    id: int
 
     @property
-    def _rpc(self) -> Rpc:
+    def _rpc(self) -> "Rpc":
         return self.manager.rpc
-
-    def __eq__(self, other) -> bool:
-        if not isinstance(other, Account):
-            return False
-        return self.id == other.id and self.manager == other.manager
-
-    def __ne__(self, other) -> bool:
-        return not self == other
-
-    def __repr__(self) -> str:
-        return f"<Account id={self.id}>"
 
     async def wait_for_event(self) -> AttrDict:
         """Wait until the next event and return it."""
@@ -89,9 +80,7 @@ class Account:
         """Configure an account."""
         await self._rpc.configure(self.id)
 
-    async def create_contact(
-        self, obj: Union[int, str, Contact], name: Optional[str] = None
-    ) -> Contact:
+    async def create_contact(self, obj: Union[int, str, Contact], name: Optional[str] = None) -> Contact:
         """Create a new Contact or return an existing one.
 
         Calling this method will always result in the same
@@ -120,10 +109,7 @@ class Account:
     async def get_blocked_contacts(self) -> List[AttrDict]:
         """Return a list with snapshots of all blocked contacts."""
         contacts = await self._rpc.get_blocked_contacts(self.id)
-        return [
-            AttrDict(contact=Contact(self, contact["id"]), **contact)
-            for contact in contacts
-        ]
+        return [AttrDict(contact=Contact(self, contact["id"]), **contact) for contact in contacts]
 
     async def get_contacts(
         self,
@@ -148,10 +134,7 @@ class Account:
 
         if snapshot:
             contacts = await self._rpc.get_contacts(self.id, flags, query)
-            return [
-                AttrDict(contact=Contact(self, contact["id"]), **contact)
-                for contact in contacts
-            ]
+            return [AttrDict(contact=Contact(self, contact["id"]), **contact) for contact in contacts]
         contacts = await self._rpc.get_contact_ids(self.id, flags, query)
         return [Contact(self, contact_id) for contact_id in contacts]
 
@@ -176,7 +159,7 @@ class Account:
         :param contact: if a contact is specified only chats including this contact are returned.
         :param archived_only: if True only archived chats are returned.
         :param for_forwarding: if True the chat list is sorted with "Saved messages" at the top
-                               and withot "Device chat" and contact requests.
+                               and without "Device chat" and contact requests.
         :param no_specials: if True archive link is not added to the list.
         :param alldone_hint: if True the "all done hint" special chat will be added to the list
                              as needed.
@@ -192,11 +175,9 @@ class Account:
         if alldone_hint:
             flags |= ChatlistFlag.ADD_ALLDONE_HINT
 
-        entries = await self._rpc.get_chatlist_entries(
-            self.id, flags, query, contact and contact.id
-        )
+        entries = await self._rpc.get_chatlist_entries(self.id, flags, query, contact and contact.id)
         if not snapshot:
-            return [Chat(self, entry[0]) for entry in entries]
+            return [Chat(self, entry) for entry in entries]
 
         items = await self._rpc.get_chatlist_items_by_entries(self.id, entries)
         chats = []
@@ -259,7 +240,22 @@ class Account:
         fresh_msg_ids = await self._rpc.get_fresh_msgs(self.id)
         return [Message(self, msg_id) for msg_id in fresh_msg_ids]
 
+    async def get_next_messages(self) -> List[Message]:
+        """Return a list of next messages."""
+        next_msg_ids = await self._rpc.get_next_msgs(self.id)
+        return [Message(self, msg_id) for msg_id in next_msg_ids]
+
+    async def wait_next_messages(self) -> List[Message]:
+        """Wait for new messages and return a list of them."""
+        next_msg_ids = await self._rpc.wait_next_msgs(self.id)
+        return [Message(self, msg_id) for msg_id in next_msg_ids]
+
     async def get_fresh_messages_in_arrival_order(self) -> List[Message]:
         """Return fresh messages list sorted in the order of their arrival, with ascending IDs."""
+        warn(
+            "get_fresh_messages_in_arrival_order is deprecated, use get_next_messages instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         fresh_msg_ids = sorted(await self._rpc.get_fresh_msgs(self.id))
         return [Message(self, msg_id) for msg_id in fresh_msg_ids]

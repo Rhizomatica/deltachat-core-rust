@@ -1,11 +1,10 @@
 //! Module to work with translatable stock strings.
 
-#![allow(missing_docs)]
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
+use humansize::{format_size, BINARY};
 use strum::EnumProperty as EnumPropertyTrait;
 use strum_macros::EnumProperty;
 use tokio::sync::RwLock;
@@ -19,8 +18,8 @@ use crate::context::Context;
 use crate::message::{Message, Viewtype};
 use crate::param::Param;
 use crate::tools::timestamp_to_str;
-use humansize::{format_size, BINARY};
 
+/// Storage for string translations.
 #[derive(Debug, Clone)]
 pub struct StockStrings {
     /// Map from stock string ID to the translation.
@@ -35,6 +34,7 @@ pub struct StockStrings {
 /// See the `stock_*` methods on [Context] to use these.
 ///
 /// [Context]: crate::context::Context
+#[allow(missing_docs)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive, EnumProperty)]
 #[repr(u32)]
 pub enum StockMessage {
@@ -404,6 +404,12 @@ pub enum StockMessage {
 
     #[strum(props(fallback = "Chat protection disabled by %1$s."))]
     ProtectionDisabledBy = 161,
+
+    #[strum(props(fallback = "Scan to set up second device for %1$s"))]
+    BackupTransferQr = 162,
+
+    #[strum(props(fallback = "ℹ️ Account transferred to your second device."))]
+    BackupTransferMsgBody = 163,
 }
 
 impl StockMessage {
@@ -422,6 +428,7 @@ impl Default for StockStrings {
 }
 
 impl StockStrings {
+    /// Creates a new translated string storage.
     pub fn new() -> Self {
         Self {
             translated_stockstrings: Arc::new(RwLock::new(Default::default())),
@@ -719,10 +726,7 @@ pub(crate) async fn secure_join_started(
             .replace1(&contact.get_name_n_addr())
             .replace2(contact.get_display_name())
     } else {
-        format!(
-            "secure_join_started: unknown contact {}",
-            inviter_contact_id
-        )
+        format!("secure_join_started: unknown contact {inviter_contact_id}")
     }
 }
 
@@ -733,7 +737,7 @@ pub(crate) async fn secure_join_replies(context: &Context, contact_id: ContactId
             .await
             .replace1(contact.get_display_name())
     } else {
-        format!("secure_join_replies: unknown contact {}", contact_id)
+        format!("secure_join_replies: unknown contact {contact_id}")
     }
 }
 
@@ -743,14 +747,14 @@ pub(crate) async fn setup_contact_qr_description(
     display_name: &str,
     addr: &str,
 ) -> String {
-    let name = &if display_name == addr {
+    let name = if display_name == addr {
         addr.to_owned()
     } else {
-        format!("{} ({})", display_name, addr)
+        format!("{display_name} ({addr})")
     };
     translated(context, StockMessage::SetupContactQRDescription)
         .await
-        .replace1(name)
+        .replace1(&name)
 }
 
 /// Stock string: `Scan to join %1$s`.
@@ -803,7 +807,7 @@ pub(crate) async fn sync_msg_subject(context: &Context) -> String {
     translated(context, StockMessage::SyncMsgSubject).await
 }
 
-/// Stock string: `This message is used to synchronize data betweeen your devices.`.
+/// Stock string: `This message is used to synchronize data between your devices.`.
 pub(crate) async fn sync_msg_body(context: &Context) -> String {
     translated(context, StockMessage::SyncMsgBody).await
 }
@@ -1117,7 +1121,7 @@ pub(crate) async fn forwarded(context: &Context) -> String {
 pub(crate) async fn quota_exceeding(context: &Context, highest_usage: u64) -> String {
     translated(context, StockMessage::QuotaExceedingMsgBody)
         .await
-        .replace1(&format!("{}", highest_usage))
+        .replace1(&format!("{highest_usage}"))
         .replace("%%", "%")
 }
 
@@ -1242,6 +1246,28 @@ pub(crate) async fn aeap_explanation_and_link(
         .replace2(new_addr)
 }
 
+/// Text to put in the [`Qr::Backup`] rendered SVG image.
+///
+/// The default is "Scan to set up second device for <account name (account addr)>".  The
+/// account name and address are looked up from the context.
+///
+/// [`Qr::Backup`]: crate::qr::Qr::Backup
+pub(crate) async fn backup_transfer_qr(context: &Context) -> Result<String> {
+    let contact = Contact::get_by_id(context, ContactId::SELF).await?;
+    let addr = contact.get_addr();
+    let full_name = match context.get_config(Config::Displayname).await? {
+        Some(name) if name != addr => format!("{name} ({addr})"),
+        _ => addr.to_string(),
+    };
+    Ok(translated(context, StockMessage::BackupTransferQr)
+        .await
+        .replace1(&full_name))
+}
+
+pub(crate) async fn backup_transfer_msg_body(context: &Context) -> String {
+    translated(context, StockMessage::BackupTransferMsgBody).await
+}
+
 impl Context {
     /// Set the stock string for the [StockMessage].
     ///
@@ -1308,12 +1334,11 @@ impl Accounts {
 mod tests {
     use num_traits::ToPrimitive;
 
+    use super::*;
     use crate::chat::delete_and_reset_all_device_msgs;
     use crate::chat::Chat;
     use crate::chatlist::Chatlist;
     use crate::test_utils::TestContext;
-
-    use super::*;
 
     #[test]
     fn test_enum_mapping() {
@@ -1453,16 +1478,10 @@ mod tests {
         };
 
         // delete self-talk first; this adds a message to device-chat about how self-talk can be restored
-        let device_chat_msgs_before = chat::get_chat_msgs(&t, device_chat_id, 0)
-            .await
-            .unwrap()
-            .len();
+        let device_chat_msgs_before = chat::get_chat_msgs(&t, device_chat_id).await.unwrap().len();
         self_talk_id.delete(&t).await.ok();
         assert_eq!(
-            chat::get_chat_msgs(&t, device_chat_id, 0)
-                .await
-                .unwrap()
-                .len(),
+            chat::get_chat_msgs(&t, device_chat_id).await.unwrap().len(),
             device_chat_msgs_before + 1
         );
 

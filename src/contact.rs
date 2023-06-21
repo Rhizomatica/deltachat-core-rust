@@ -1,11 +1,10 @@
 //! Contacts module
 
-#![allow(missing_docs)]
-
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::convert::{TryFrom, TryInto};
 use std::fmt;
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,6 +13,7 @@ use async_channel::{self as channel, Receiver, Sender};
 use deltachat_derive::{FromSql, ToSql};
 use once_cell::sync::Lazy;
 use regex::Regex;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use tokio::task;
 use tokio::time::{timeout, Duration};
@@ -32,11 +32,59 @@ use crate::mimeparser::AvatarAction;
 use crate::param::{Param, Params};
 use crate::peerstate::{Peerstate, PeerstateVerifiedStatus};
 use crate::sql::{self, params_iter};
-use crate::tools::{duration_to_str, get_abs_path, improve_single_line_input, time, EmailAddress};
+use crate::tools::{
+    duration_to_str, get_abs_path, improve_single_line_input, strip_rtlo_characters, time,
+    EmailAddress,
+};
 use crate::{chat, stock_str};
 
 /// Time during which a contact is considered as seen recently.
 const SEEN_RECENTLY_SECONDS: i64 = 600;
+
+/// Valid contact address.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ContactAddress<'a>(&'a str);
+
+impl Deref for ContactAddress<'_> {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+    }
+}
+
+impl AsRef<str> for ContactAddress<'_> {
+    fn as_ref(&self) -> &str {
+        self.0
+    }
+}
+
+impl fmt::Display for ContactAddress<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl<'a> ContactAddress<'a> {
+    /// Constructs a new contact address from string,
+    /// normalizing and validating it.
+    pub fn new(s: &'a str) -> Result<Self> {
+        let addr = addr_normalize(s);
+        if !may_be_valid_addr(addr) {
+            bail!("invalid address {:?}", s);
+        }
+        Ok(Self(addr))
+    }
+}
+
+/// Allow converting [`ContactAddress`] to an SQLite type.
+impl rusqlite::types::ToSql for ContactAddress<'_> {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput> {
+        let val = rusqlite::types::Value::Text(self.0.to_string());
+        let out = rusqlite::types::ToSqlOutput::Owned(val);
+        Ok(out)
+    }
+}
 
 /// Contact ID, including reserved IDs.
 ///
@@ -48,12 +96,18 @@ const SEEN_RECENTLY_SECONDS: i64 = 600;
 pub struct ContactId(u32);
 
 impl ContactId {
+    /// Undefined contact. Used as a placeholder for trashed messages.
     pub const UNDEFINED: ContactId = ContactId::new(0);
+
     /// The owner of the account.
     ///
     /// The email-address is set by `set_config` using "addr".
     pub const SELF: ContactId = ContactId::new(1);
+
+    /// ID of the contact for info messages.
     pub const INFO: ContactId = ContactId::new(2);
+
+    /// ID of the contact for device messages.
     pub const DEVICE: ContactId = ContactId::new(5);
     const LAST_SPECIAL: ContactId = ContactId::new(9);
 
@@ -173,10 +227,24 @@ pub struct Contact {
 
 /// Possible origins of a contact.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, FromPrimitive, ToPrimitive, FromSql, ToSql,
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    FromPrimitive,
+    ToPrimitive,
+    FromSql,
+    ToSql,
 )]
 #[repr(u32)]
 pub enum Origin {
+    /// Unknown origin. Can be used as a minimum origin to specify that the caller does not care
+    /// about origin of the contact.
+    #[default]
     Unknown = 0,
 
     /// The contact is a mailing list address, needed to unblock mailing lists
@@ -235,12 +303,6 @@ pub enum Origin {
     ManuallyCreated = 0x0400_0000,
 }
 
-impl Default for Origin {
-    fn default() -> Self {
-        Origin::Unknown
-    }
-}
-
 impl Origin {
     /// Contacts that are known, i. e. they came in via accepted contacts or
     /// themselves an accepted contact. Known contacts are shown in the
@@ -257,12 +319,13 @@ pub(crate) enum Modifier {
     Created,
 }
 
+/// Verification status of the contact.
 #[derive(Debug, PartialEq, Eq, Clone, Copy, FromPrimitive)]
 #[repr(u8)]
 pub enum VerifiedStatus {
     /// Contact is not verified.
     Unverified = 0,
-    // TODO: is this a thing?
+    /// SELF has verified the fingerprint of a contact. Currently unused.
     Verified = 1,
     /// SELF and contact have verified their fingerprints in both directions; in the UI typically checkmarks are shown.
     BidirectVerified = 2,
@@ -275,6 +338,7 @@ impl Default for VerifiedStatus {
 }
 
 impl Contact {
+    /// Loads a contact snapshot from the database.
     pub async fn load_from_db(context: &Context, contact_id: ContactId) -> Result<Self> {
         let mut contact = context
             .sql
@@ -283,7 +347,7 @@ impl Contact {
                 c.authname, c.param, c.status
                FROM contacts c
               WHERE c.id=?;",
-                paramsv![contact_id],
+                (contact_id,),
                 |row| {
                     let name: String = row.get(0)?;
                     let addr: String = row.get(1)?;
@@ -368,12 +432,14 @@ impl Contact {
     /// May result in a `#DC_EVENT_CONTACTS_CHANGED` event.
     pub async fn create(context: &Context, name: &str, addr: &str) -> Result<ContactId> {
         let name = improve_single_line_input(name);
-        ensure!(!addr.is_empty(), "Cannot create contact with empty address");
 
         let (name, addr) = sanitize_name_and_addr(&name, addr);
+        let addr = ContactAddress::new(&addr)?;
 
         let (contact_id, sth_modified) =
-            Contact::add_or_lookup(context, &name, &addr, Origin::ManuallyCreated).await?;
+            Contact::add_or_lookup(context, &name, addr, Origin::ManuallyCreated)
+                .await
+                .context("add_or_lookup")?;
         let blocked = Contact::is_blocked_load(context, contact_id).await?;
         match sth_modified {
             Modifier::None => {}
@@ -394,7 +460,7 @@ impl Contact {
             .sql
             .execute(
                 "UPDATE msgs SET state=? WHERE from_id=? AND state=?;",
-                paramsv![MessageState::InNoticed, id, MessageState::InFresh],
+                (MessageState::InNoticed, id, MessageState::InFresh),
             )
             .await?;
         Ok(())
@@ -427,7 +493,7 @@ impl Contact {
                 "SELECT id FROM contacts \
             WHERE addr=?1 COLLATE NOCASE \
             AND id>?2 AND origin>=?3 AND blocked=0;",
-                paramsv![addr_normalized, ContactId::LAST_SPECIAL, min_origin as u32,],
+                (&addr_normalized, ContactId::LAST_SPECIAL, min_origin as u32),
             )
             .await?;
         Ok(id)
@@ -461,7 +527,7 @@ impl Contact {
     pub(crate) async fn add_or_lookup(
         context: &Context,
         name: &str,
-        addr: &str,
+        addr: ContactAddress<'_>,
         mut origin: Origin,
     ) -> Result<(ContactId, Modifier)> {
         let mut sth_modified = Modifier::None;
@@ -469,23 +535,11 @@ impl Contact {
         ensure!(!addr.is_empty(), "Can not add_or_lookup empty address");
         ensure!(origin != Origin::Unknown, "Missing valid origin");
 
-        let addr = addr_normalize(addr).to_string();
-
         if context.is_self_addr(&addr).await? {
             return Ok((ContactId::SELF, sth_modified));
         }
 
-        if !may_be_valid_addr(&addr) {
-            warn!(
-                context,
-                "Bad address \"{}\" for contact \"{}\".",
-                addr,
-                if !name.is_empty() { name } else { "<unset>" },
-            );
-            bail!("Bad address supplied: {:?}", addr);
-        }
-
-        let mut name = name;
+        let mut name = strip_rtlo_characters(name);
         #[allow(clippy::collapsible_if)]
         if origin <= Origin::OutgoingTo {
             // The user may accidentally have written to a "noreply" address with another MUA:
@@ -500,7 +554,7 @@ impl Contact {
                 // For these kind of email addresses, sender and address often don't belong together
                 // (like hocuri <notifications@github.com>). In this example, hocuri shouldn't
                 // be saved as the displayname for notifications@github.com.
-                name = "";
+                name = "".to_string();
             }
         }
 
@@ -514,14 +568,12 @@ impl Contact {
         );
 
         let mut update_addr = false;
-        let mut row_id = 0;
 
-        if let Some((id, row_name, row_addr, row_origin, row_authname)) = context
-            .sql
-            .query_row_optional(
-                "SELECT id, name, addr, origin, authname \
-            FROM contacts WHERE addr=? COLLATE NOCASE;",
-                paramsv![addr.to_string()],
+        let row_id = context.sql.transaction(|transaction| {
+            let row = transaction.query_row(
+                "SELECT id, name, addr, origin, authname
+                 FROM contacts WHERE addr=? COLLATE NOCASE",
+                 [addr.to_string()],
                 |row| {
                     let row_id: isize = row.get(0)?;
                     let row_name: String = row.get(1)?;
@@ -530,120 +582,130 @@ impl Contact {
                     let row_authname: String = row.get(4)?;
 
                     Ok((row_id, row_name, row_addr, row_origin, row_authname))
-                },
-            )
-            .await?
-        {
-            let update_name = manual && name != row_name;
-            let update_authname = !manual
-                && name != row_authname
-                && !name.is_empty()
-                && (origin >= row_origin
-                    || origin == Origin::IncomingUnknownFrom
-                    || row_authname.is_empty());
+                }).optional()?;
 
-            row_id = u32::try_from(id)?;
-            if origin as i32 >= row_origin as i32 && addr != row_addr {
-                update_addr = true;
-            }
-            if update_name || update_authname || update_addr || origin > row_origin {
-                let new_name = if update_name {
-                    name.to_string()
-                } else {
-                    row_name
-                };
+            let row_id;
+            if let Some((id, row_name, row_addr, row_origin, row_authname)) = row {
+                let update_name = manual && name != row_name;
+                let update_authname = !manual
+                    && name != row_authname
+                    && !name.is_empty()
+                    && (origin >= row_origin
+                        || origin == Origin::IncomingUnknownFrom
+                        || row_authname.is_empty());
 
-                context
-                    .sql
-                    .execute(
-                        "UPDATE contacts SET name=?, addr=?, origin=?, authname=? WHERE id=?;",
-                        paramsv![
-                            new_name,
-                            if update_addr {
-                                addr.to_string()
-                            } else {
-                                row_addr
-                            },
-                            if origin > row_origin {
-                                origin
-                            } else {
-                                row_origin
-                            },
-                            if update_authname {
-                                name.to_string()
-                            } else {
-                                row_authname
-                            },
-                            row_id
-                        ],
-                    )
-                    .await
-                    .ok();
+                row_id = u32::try_from(id)?;
+                if origin >= row_origin && addr.as_ref() != row_addr {
+                    update_addr = true;
+                }
+                if update_name || update_authname || update_addr || origin > row_origin {
+                    let new_name = if update_name {
+                        name.to_string()
+                    } else {
+                        row_name
+                    };
 
-                if update_name || update_authname {
-                    // Update the contact name also if it is used as a group name.
-                    // This is one of the few duplicated data, however, getting the chat list is easier this way.
-                    let chat_id: Option<i32> = context.sql.query_get_value(
-                        "SELECT id FROM chats WHERE type=? AND id IN(SELECT chat_id FROM chats_contacts WHERE contact_id=?)",
-                        paramsv![Chattype::Single, isize::try_from(row_id)?]
-                    ).await?;
-                    if let Some(chat_id) = chat_id {
-                        let contact = Contact::get_by_id(context, ContactId::new(row_id)).await?;
-                        let chat_name = contact.get_display_name();
-                        match context
-                            .sql
-                            .execute(
-                                "UPDATE chats SET name=?1 WHERE id=?2 AND name!=?3",
-                                paramsv![chat_name, chat_id, chat_name],
-                            )
-                            .await
-                        {
-                            Err(err) => warn!(context, "Can't update chat name: {}", err),
-                            Ok(count) => {
-                                if count > 0 {
-                                    // Chat name updated
-                                    context.emit_event(EventType::ChatModified(ChatId::new(
-                                        chat_id.try_into()?,
-                                    )));
-                                }
+                    transaction
+                        .execute(
+                            "UPDATE contacts SET name=?, addr=?, origin=?, authname=? WHERE id=?;",
+                            (
+                                new_name,
+                                if update_addr {
+                                    addr.to_string()
+                                } else {
+                                    row_addr
+                                },
+                                if origin > row_origin {
+                                    origin
+                                } else {
+                                    row_origin
+                                },
+                                if update_authname {
+                                    name.to_string()
+                                } else {
+                                    row_authname
+                                },
+                                row_id
+                            ),
+                        )?;
+
+                    if update_name || update_authname {
+                        // Update the contact name also if it is used as a group name.
+                        // This is one of the few duplicated data, however, getting the chat list is easier this way.
+                        let chat_id: Option<ChatId> = transaction.query_row(
+                            "SELECT id FROM chats WHERE type=? AND id IN(SELECT chat_id FROM chats_contacts WHERE contact_id=?)",
+                            (Chattype::Single, isize::try_from(row_id)?),
+                            |row| {
+                                let chat_id: ChatId = row.get(0)?;
+                                Ok(chat_id)
+                            }
+                        ).optional()?;
+
+                        if let Some(chat_id) = chat_id {
+                            let contact_id = ContactId::new(row_id);
+                            let (addr, name, authname) =
+                                transaction.query_row(
+                                    "SELECT addr, name, authname
+                                     FROM contacts
+                                     WHERE id=?",
+                                     (contact_id,),
+                                |row| {
+                                    let addr: String = row.get(0)?;
+                                    let name: String = row.get(1)?;
+                                    let authname: String = row.get(2)?;
+                                    Ok((addr, name, authname))
+                                })?;
+
+                            let chat_name = if !name.is_empty() {
+                                name
+                            } else if !authname.is_empty() {
+                                authname
+                            } else {
+                                addr
+                            };
+
+                            let count = transaction.execute(
+                                    "UPDATE chats SET name=?1 WHERE id=?2 AND name!=?1",
+                                    (chat_name, chat_id))?;
+
+                            if count > 0 {
+                                // Chat name updated
+                                context.emit_event(EventType::ChatModified(chat_id));
                             }
                         }
                     }
+                    sth_modified = Modifier::Modified;
                 }
-                sth_modified = Modifier::Modified;
-            }
-        } else {
-            let update_name = manual;
-            let update_authname = !manual;
-
-            if let Ok(new_row_id) = context
-                .sql
-                .insert(
-                    "INSERT INTO contacts (name, addr, origin, authname) VALUES(?, ?, ?, ?);",
-                    paramsv![
-                        if update_name {
-                            name.to_string()
-                        } else {
-                            "".to_string()
-                        },
-                        addr,
-                        origin,
-                        if update_authname {
-                            name.to_string()
-                        } else {
-                            "".to_string()
-                        }
-                    ],
-                )
-                .await
-            {
-                row_id = u32::try_from(new_row_id)?;
-                sth_modified = Modifier::Created;
-                info!(context, "added contact id={} addr={}", row_id, &addr);
             } else {
-                error!(context, "Cannot add contact.");
+                let update_name = manual;
+                let update_authname = !manual;
+
+                transaction
+                    .execute(
+                        "INSERT INTO contacts (name, addr, origin, authname)
+                         VALUES (?, ?, ?, ?);",
+                         (
+                            if update_name {
+                                name.to_string()
+                            } else {
+                                "".to_string()
+                            },
+                            addr,
+                            origin,
+                            if update_authname {
+                                name.to_string()
+                            } else {
+                                "".to_string()
+                            }
+                        ),
+                    )?;
+
+                sth_modified = Modifier::Created;
+                row_id = u32::try_from(transaction.last_insert_rowid())?;
+                info!(context, "added contact id={} addr={}", row_id, &addr);
             }
-        }
+            Ok(row_id)
+        }).await?;
 
         Ok((ContactId::new(row_id), sth_modified))
     }
@@ -668,20 +730,27 @@ impl Contact {
     pub async fn add_address_book(context: &Context, addr_book: &str) -> Result<usize> {
         let mut modify_cnt = 0;
 
-        for (name, addr) in split_address_book(addr_book).into_iter() {
+        for (name, addr) in split_address_book(addr_book) {
             let (name, addr) = sanitize_name_and_addr(name, addr);
             let name = normalize_name(&name);
-            match Contact::add_or_lookup(context, &name, &addr, Origin::AddressBook).await {
-                Err(err) => {
-                    warn!(
-                        context,
-                        "Failed to add address {} from address book: {}", addr, err
-                    );
-                }
-                Ok((_, modified)) => {
-                    if modified != Modifier::None {
-                        modify_cnt += 1
+            match ContactAddress::new(&addr) {
+                Ok(addr) => {
+                    match Contact::add_or_lookup(context, &name, addr, Origin::AddressBook).await {
+                        Ok((_, modified)) => {
+                            if modified != Modifier::None {
+                                modify_cnt += 1
+                            }
+                        }
+                        Err(err) => {
+                            warn!(
+                                context,
+                                "Failed to add address {} from address book: {}", addr, err
+                            );
+                        }
                     }
+                }
+                Err(err) => {
+                    warn!(context, "{:#}.", err);
                 }
             }
         }
@@ -729,12 +798,12 @@ impl Contact {
                  ORDER BY c.last_seen DESC, c.id DESC;",
                         sql::repeat_vars(self_addrs.len())
                     ),
-                    rusqlite::params_from_iter(params_iter(&self_addrs).chain(params_iterv![
+                    rusqlite::params_from_iter(params_iter(&self_addrs).chain(params_slice![
                         ContactId::LAST_SPECIAL,
                         Origin::IncomingReplyTo,
                         s3str_like_cmd,
                         s3str_like_cmd,
-                        if flag_verified_only { 0i32 } else { 1i32 },
+                        if flag_verified_only { 0i32 } else { 1i32 }
                     ])),
                     |row| row.get::<_, ContactId>(0),
                     |ids| {
@@ -781,7 +850,7 @@ impl Contact {
                  ORDER BY last_seen DESC, id DESC;",
                         sql::repeat_vars(self_addrs.len())
                     ),
-                    rusqlite::params_from_iter(params_iter(&self_addrs).chain(params_iterv![
+                    rusqlite::params_from_iter(params_iter(&self_addrs).chain(params_slice![
                         ContactId::LAST_SPECIAL,
                         Origin::IncomingReplyTo
                     ])),
@@ -803,56 +872,55 @@ impl Contact {
         Ok(ret)
     }
 
-    // add blocked mailinglists as contacts
-    // to allow unblocking them as if they are contacts
-    // (this way, only one unblock-ffi is needed and only one set of ui-functions,
-    // from the users perspective,
-    // there is not much difference in an email- and a mailinglist-address)
+    /// Adds blocked mailinglists as contacts
+    /// to allow unblocking them as if they are contacts
+    /// (this way, only one unblock-ffi is needed and only one set of ui-functions,
+    /// from the users perspective,
+    /// there is not much difference in an email- and a mailinglist-address)
     async fn update_blocked_mailinglist_contacts(context: &Context) -> Result<()> {
-        let blocked_mailinglists = context
+        context
             .sql
-            .query_map(
-                "SELECT name, grpid FROM chats WHERE type=? AND blocked=?;",
-                paramsv![Chattype::Mailinglist, Blocked::Yes],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                |rows| {
-                    rows.collect::<std::result::Result<Vec<_>, _>>()
-                        .map_err(Into::into)
-                },
-            )
+            .transaction(move |transaction| {
+                let mut stmt = transaction
+                    .prepare("SELECT name, grpid FROM chats WHERE type=? AND blocked=?")?;
+                let rows = stmt.query_map((Chattype::Mailinglist, Blocked::Yes), |row| {
+                    let name: String = row.get(0)?;
+                    let grpid: String = row.get(1)?;
+                    Ok((name, grpid))
+                })?;
+                let blocked_mailinglists = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+                for (name, grpid) in blocked_mailinglists {
+                    let count = transaction.query_row(
+                        "SELECT COUNT(id) FROM contacts WHERE addr=?",
+                        [&grpid],
+                        |row| {
+                            let count: isize = row.get(0)?;
+                            Ok(count)
+                        },
+                    )?;
+                    if count == 0 {
+                        transaction.execute("INSERT INTO contacts (addr) VALUES (?)", [&grpid])?;
+                    }
+
+                    // Always do an update in case the blocking is reset or name is changed.
+                    transaction.execute(
+                        "UPDATE contacts SET name=?, origin=?, blocked=1 WHERE addr=?",
+                        (&name, Origin::MailinglistAddress, &grpid),
+                    )?;
+                }
+                Ok(())
+            })
             .await?;
-        for (name, grpid) in blocked_mailinglists {
-            if !context
-                .sql
-                .exists(
-                    "SELECT COUNT(id) FROM contacts WHERE addr=?;",
-                    paramsv![grpid],
-                )
-                .await?
-            {
-                context
-                    .sql
-                    .execute("INSERT INTO contacts (addr) VALUES (?);", paramsv![grpid])
-                    .await?;
-            }
-            // always do an update in case the blocking is reset or name is changed
-            context
-                .sql
-                .execute(
-                    "UPDATE contacts SET name=?, origin=?, blocked=1 WHERE addr=?;",
-                    paramsv![name, Origin::MailinglistAddress, grpid],
-                )
-                .await?;
-        }
         Ok(())
     }
 
+    /// Returns number of blocked contacts.
     pub async fn get_blocked_cnt(context: &Context) -> Result<usize> {
         let count = context
             .sql
             .count(
                 "SELECT COUNT(*) FROM contacts WHERE id>? AND blocked!=0",
-                paramsv![ContactId::LAST_SPECIAL],
+                (ContactId::LAST_SPECIAL,),
             )
             .await?;
         Ok(count)
@@ -868,7 +936,7 @@ impl Contact {
             .sql
             .query_map(
                 "SELECT id FROM contacts WHERE id>? AND blocked!=0 ORDER BY last_seen DESC, id DESC;",
-                paramsv![ContactId::LAST_SPECIAL],
+                (ContactId::LAST_SPECIAL,),
                 |row| row.get::<_, ContactId>(0),
                 |ids| {
                     ids.collect::<std::result::Result<Vec<_>, _>>()
@@ -907,7 +975,7 @@ impl Contact {
                 };
 
                 let finger_prints = stock_str::finger_prints(context).await;
-                ret += &format!("{}.\n{}:", stock_message, finger_prints);
+                ret += &format!("{stock_message}.\n{finger_prints}:");
 
                 let fingerprint_self = SignedPublicKey::load_self(context)
                     .await?
@@ -962,12 +1030,12 @@ impl Contact {
                 let deleted_contacts = transaction.execute(
                     "DELETE FROM contacts WHERE id=?
                      AND (SELECT COUNT(*) FROM chats_contacts WHERE contact_id=?)=0;",
-                    paramsv![contact_id, contact_id],
+                    (contact_id, contact_id),
                 )?;
                 if deleted_contacts == 0 {
                     transaction.execute(
                         "UPDATE contacts SET origin=? WHERE id=?;",
-                        paramsv![Origin::Hidden, contact_id],
+                        (Origin::Hidden, contact_id),
                     )?;
                 }
                 Ok(())
@@ -995,7 +1063,7 @@ impl Contact {
             .sql
             .execute(
                 "UPDATE contacts SET param=? WHERE id=?",
-                paramsv![self.param.to_string(), self.id],
+                (self.param.to_string(), self.id),
             )
             .await?;
         Ok(())
@@ -1007,7 +1075,7 @@ impl Contact {
             .sql
             .execute(
                 "UPDATE contacts SET status=? WHERE id=?",
-                paramsv![self.status, self.id],
+                (&self.status, self.id),
             )
             .await?;
         Ok(())
@@ -1127,9 +1195,7 @@ impl Contact {
             if peerstate.verified_key.is_some() {
                 return Ok(VerifiedStatus::BidirectVerified);
             }
-        }
-
-        if let Some(peerstate) = Peerstate::from_addr(context, &self.addr).await? {
+        } else if let Some(peerstate) = Peerstate::from_addr(context, &self.addr).await? {
             if peerstate.verified_key.is_some() {
                 return Ok(VerifiedStatus::BidirectVerified);
             }
@@ -1138,23 +1204,16 @@ impl Contact {
         Ok(VerifiedStatus::Unverified)
     }
 
-    /// Return the address that verified the given contact
-    pub async fn get_verifier_addr(
-        context: &Context,
-        contact_id: &ContactId,
-    ) -> Result<Option<String>> {
-        let contact = Contact::load_from_db(context, *contact_id).await?;
-
-        Ok(Peerstate::from_addr(context, contact.get_addr())
+    /// Returns the address that verified the contact.
+    pub async fn get_verifier_addr(&self, context: &Context) -> Result<Option<String>> {
+        Ok(Peerstate::from_addr(context, self.get_addr())
             .await?
             .and_then(|peerstate| peerstate.get_verifier().map(|addr| addr.to_owned())))
     }
 
-    pub async fn get_verifier_id(
-        context: &Context,
-        contact_id: &ContactId,
-    ) -> Result<Option<ContactId>> {
-        let verifier_addr = Contact::get_verifier_addr(context, contact_id).await?;
+    /// Returns the ContactId that verified the contact.
+    pub async fn get_verifier_id(&self, context: &Context) -> Result<Option<ContactId>> {
+        let verifier_addr = self.get_verifier_addr(context).await?;
         if let Some(addr) = verifier_addr {
             Ok(Contact::lookup_id_by_addr(context, &addr, Origin::AddressBook).await?)
         } else {
@@ -1162,7 +1221,7 @@ impl Contact {
         }
     }
 
-    /// Return the ContactId that verified the given contact
+    /// Returns the number of real (i.e. non-special) contacts in the database.
     pub async fn get_real_cnt(context: &Context) -> Result<usize> {
         if !context.sql.is_open().await {
             return Ok(0);
@@ -1172,12 +1231,13 @@ impl Contact {
             .sql
             .count(
                 "SELECT COUNT(*) FROM contacts WHERE id>?;",
-                paramsv![ContactId::LAST_SPECIAL],
+                (ContactId::LAST_SPECIAL,),
             )
             .await?;
         Ok(count)
     }
 
+    /// Returns true if a contact with this ID exists.
     pub async fn real_exists_by_id(context: &Context, contact_id: ContactId) -> Result<bool> {
         if contact_id.is_special() {
             return Ok(false);
@@ -1185,14 +1245,12 @@ impl Contact {
 
         let exists = context
             .sql
-            .exists(
-                "SELECT COUNT(*) FROM contacts WHERE id=?;",
-                paramsv![contact_id],
-            )
+            .exists("SELECT COUNT(*) FROM contacts WHERE id=?;", (contact_id,))
             .await?;
         Ok(exists)
     }
 
+    /// Updates the origin of the contact, but only if new origin is higher than the current one.
     pub async fn scaleup_origin_by_id(
         context: &Context,
         contact_id: ContactId,
@@ -1202,7 +1260,7 @@ impl Contact {
             .sql
             .execute(
                 "UPDATE contacts SET origin=? WHERE id=? AND origin<?;",
-                paramsv![origin, contact_id, origin],
+                (origin, contact_id, origin),
             )
             .await?;
         Ok(())
@@ -1231,18 +1289,20 @@ fn sanitize_name_and_addr(name: &str, addr: &str) -> (String, String) {
     if let Some(captures) = ADDR_WITH_NAME_REGEX.captures(addr.as_ref()) {
         (
             if name.is_empty() {
-                captures
-                    .get(1)
-                    .map_or("".to_string(), |m| normalize_name(m.as_str()))
+                strip_rtlo_characters(
+                    &captures
+                        .get(1)
+                        .map_or("".to_string(), |m| normalize_name(m.as_str())),
+                )
             } else {
-                name.to_string()
+                strip_rtlo_characters(name)
             },
             captures
                 .get(2)
                 .map_or("".to_string(), |m| m.as_str().to_string()),
         )
     } else {
-        (name.to_string(), addr.to_string())
+        (strip_rtlo_characters(name), addr.to_string())
     }
 }
 
@@ -1264,7 +1324,7 @@ async fn set_block_contact(
             .sql
             .execute(
                 "UPDATE contacts SET blocked=? WHERE id=?;",
-                paramsv![i32::from(new_blocking), contact_id],
+                (i32::from(new_blocking), contact_id),
             )
             .await?;
 
@@ -1283,7 +1343,7 @@ WHERE type=? AND id IN (
   SELECT chat_id FROM chats_contacts WHERE contact_id=?
 );
 "#,
-                paramsv![new_blocking, Chattype::Single, contact_id],
+                (new_blocking, Chattype::Single, contact_id),
             )
             .await
             .is_ok()
@@ -1400,12 +1460,16 @@ pub(crate) async fn update_last_seen(
         .sql
         .execute(
             "UPDATE contacts SET last_seen = ?1 WHERE last_seen < ?1 AND id = ?2",
-            paramsv![timestamp, contact_id],
+            (timestamp, contact_id),
         )
         .await?
         > 0
+        && timestamp > time() - SEEN_RECENTLY_SECONDS
     {
-        context.interrupt_recently_seen(contact_id, timestamp).await;
+        context
+            .scheduler
+            .interrupt_recently_seen(contact_id, timestamp)
+            .await;
     }
     Ok(())
 }
@@ -1425,7 +1489,7 @@ pub fn normalize_name(full_name: &str) -> String {
     match full_name.as_bytes() {
         [b'\'', .., b'\''] | [b'\"', .., b'\"'] | [b'<', .., b'>'] => full_name
             .get(1..full_name.len() - 1)
-            .map_or("".to_string(), |s| s.trim().into()),
+            .map_or("".to_string(), |s| s.trim().to_string()),
         _ => full_name.to_string(),
     }
 }
@@ -1449,10 +1513,11 @@ fn cat_fingerprint(
         && !fingerprint_unverified.is_empty()
         && fingerprint_verified != fingerprint_unverified
     {
-        *ret += &format!("\n\n{} (alternative):\n{}", addr, fingerprint_unverified);
+        *ret += &format!("\n\n{addr} (alternative):\n{fingerprint_unverified}");
     }
 }
 
+/// Compares two email addresses, normalizing them beforehand.
 pub fn addr_cmp(addr1: &str, addr2: &str) -> bool {
     let norm1 = addr_normalize(addr1).to_lowercase();
     let norm2 = addr_normalize(addr2).to_lowercase();
@@ -1464,7 +1529,6 @@ fn split_address_book(book: &str) -> Vec<(&str, &str)> {
     book.lines()
         .collect::<Vec<&str>>()
         .chunks(2)
-        .into_iter()
         .filter_map(|chunk| {
             let name = chunk.first()?;
             let addr = chunk.get(1)?;
@@ -1491,7 +1555,7 @@ impl RecentlySeenLoop {
     pub(crate) fn new(context: Context) -> Self {
         let (interrupt_send, interrupt_recv) = channel::bounded(1);
 
-        let handle = task::spawn(async move { Self::run(context, interrupt_recv).await });
+        let handle = task::spawn(Self::run(context, interrupt_recv));
         Self {
             handle,
             interrupt_send,
@@ -1511,7 +1575,7 @@ impl RecentlySeenLoop {
             .query_map(
                 "SELECT id, last_seen FROM contacts
                  WHERE last_seen > ?",
-                paramsv![time() - SEEN_RECENTLY_SECONDS],
+                (time() - SEEN_RECENTLY_SECONDS,),
                 |row| {
                     let contact_id: ContactId = row.get("id")?;
                     let last_seen: i64 = row.get("last_seen")?;
@@ -1561,6 +1625,9 @@ impl RecentlySeenLoop {
                             context,
                             "Error receiving an interruption in recently seen loop: {}", err
                         );
+                        // Maybe the sender side is closed.
+                        // Terminate the loop to avoid looping indefinitely.
+                        return;
                     }
                     Ok(Ok(RecentlySeenInterrupt {
                         contact_id,
@@ -1602,7 +1669,6 @@ impl RecentlySeenLoop {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::chat::{get_chat_contacts, send_text_msg, Chat};
     use crate::chatlist::Chatlist;
     use crate::receive_imf::receive_imf;
@@ -1680,7 +1746,7 @@ mod tests {
         let (id, _modified) = Contact::add_or_lookup(
             &context.ctx,
             "bob",
-            "user@example.org",
+            ContactAddress::new("user@example.org")?,
             Origin::IncomingReplyTo,
         )
         .await?;
@@ -1708,7 +1774,7 @@ mod tests {
         let (contact_bob_id, modified) = Contact::add_or_lookup(
             &context.ctx,
             "someone",
-            "user@example.org",
+            ContactAddress::new("user@example.org")?,
             Origin::ManuallyCreated,
         )
         .await?;
@@ -1743,6 +1809,18 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_contact_address() -> Result<()> {
+        let alice_addr = "alice@example.org";
+        let contact_address = ContactAddress::new(alice_addr)?;
+        assert_eq!(contact_address.as_ref(), alice_addr);
+
+        let invalid_addr = "<> foobar";
+        assert!(ContactAddress::new(invalid_addr).is_err());
+
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_add_or_lookup() {
         // add some contacts, this also tests add_address_book()
@@ -1758,10 +1836,14 @@ mod tests {
         assert_eq!(Contact::add_address_book(&t, book).await.unwrap(), 4);
 
         // check first added contact, this modifies authname because it is empty
-        let (contact_id, sth_modified) =
-            Contact::add_or_lookup(&t, "bla foo", "one@eins.org", Origin::IncomingUnknownTo)
-                .await
-                .unwrap();
+        let (contact_id, sth_modified) = Contact::add_or_lookup(
+            &t,
+            "bla foo",
+            ContactAddress::new("one@eins.org").unwrap(),
+            Origin::IncomingUnknownTo,
+        )
+        .await
+        .unwrap();
         assert!(!contact_id.is_special());
         assert_eq!(sth_modified, Modifier::Modified);
         let contact = Contact::load_from_db(&t, contact_id).await.unwrap();
@@ -1773,10 +1855,14 @@ mod tests {
         assert_eq!(contact.get_name_n_addr(), "Name one (one@eins.org)");
 
         // modify first added contact
-        let (contact_id_test, sth_modified) =
-            Contact::add_or_lookup(&t, "Real one", " one@eins.org  ", Origin::ManuallyCreated)
-                .await
-                .unwrap();
+        let (contact_id_test, sth_modified) = Contact::add_or_lookup(
+            &t,
+            "Real one",
+            ContactAddress::new(" one@eins.org  ").unwrap(),
+            Origin::ManuallyCreated,
+        )
+        .await
+        .unwrap();
         assert_eq!(contact_id, contact_id_test);
         assert_eq!(sth_modified, Modifier::Modified);
         let contact = Contact::load_from_db(&t, contact_id).await.unwrap();
@@ -1785,10 +1871,14 @@ mod tests {
         assert!(!contact.is_blocked());
 
         // check third added contact (contact without name)
-        let (contact_id, sth_modified) =
-            Contact::add_or_lookup(&t, "", "three@drei.sam", Origin::IncomingUnknownTo)
-                .await
-                .unwrap();
+        let (contact_id, sth_modified) = Contact::add_or_lookup(
+            &t,
+            "",
+            ContactAddress::new("three@drei.sam").unwrap(),
+            Origin::IncomingUnknownTo,
+        )
+        .await
+        .unwrap();
         assert!(!contact_id.is_special());
         assert_eq!(sth_modified, Modifier::None);
         let contact = Contact::load_from_db(&t, contact_id).await.unwrap();
@@ -1801,7 +1891,7 @@ mod tests {
         let (contact_id_test, sth_modified) = Contact::add_or_lookup(
             &t,
             "m. serious",
-            "three@drei.sam",
+            ContactAddress::new("three@drei.sam").unwrap(),
             Origin::IncomingUnknownFrom,
         )
         .await
@@ -1813,10 +1903,14 @@ mod tests {
         assert!(!contact.is_blocked());
 
         // manually edit name of third contact (does not changed authorized name)
-        let (contact_id_test, sth_modified) =
-            Contact::add_or_lookup(&t, "schnucki", "three@drei.sam", Origin::ManuallyCreated)
-                .await
-                .unwrap();
+        let (contact_id_test, sth_modified) = Contact::add_or_lookup(
+            &t,
+            "schnucki",
+            ContactAddress::new("three@drei.sam").unwrap(),
+            Origin::ManuallyCreated,
+        )
+        .await
+        .unwrap();
         assert_eq!(contact_id, contact_id_test);
         assert_eq!(sth_modified, Modifier::Modified);
         let contact = Contact::load_from_db(&t, contact_id).await.unwrap();
@@ -1825,10 +1919,14 @@ mod tests {
         assert!(!contact.is_blocked());
 
         // Fourth contact:
-        let (contact_id, sth_modified) =
-            Contact::add_or_lookup(&t, "", "alice@w.de", Origin::IncomingUnknownTo)
-                .await
-                .unwrap();
+        let (contact_id, sth_modified) = Contact::add_or_lookup(
+            &t,
+            "",
+            ContactAddress::new("alice@w.de").unwrap(),
+            Origin::IncomingUnknownTo,
+        )
+        .await
+        .unwrap();
         assert!(!contact_id.is_special());
         assert_eq!(sth_modified, Modifier::None);
         let contact = Contact::load_from_db(&t, contact_id).await.unwrap();
@@ -1963,9 +2061,13 @@ mod tests {
         assert!(Contact::delete(&alice, ContactId::SELF).await.is_err());
 
         // Create Bob contact
-        let (contact_id, _) =
-            Contact::add_or_lookup(&alice, "Bob", "bob@example.net", Origin::ManuallyCreated)
-                .await?;
+        let (contact_id, _) = Contact::add_or_lookup(
+            &alice,
+            "Bob",
+            ContactAddress::new("bob@example.net")?,
+            Origin::ManuallyCreated,
+        )
+        .await?;
         let chat = alice
             .create_chat_with_contact("Bob", "bob@example.net")
             .await;
@@ -2038,10 +2140,14 @@ mod tests {
         let t = TestContext::new().await;
 
         // incoming mail `From: bob1 <bob@example.org>` - this should init authname
-        let (contact_id, sth_modified) =
-            Contact::add_or_lookup(&t, "bob1", "bob@example.org", Origin::IncomingUnknownFrom)
-                .await
-                .unwrap();
+        let (contact_id, sth_modified) = Contact::add_or_lookup(
+            &t,
+            "bob1",
+            ContactAddress::new("bob@example.org").unwrap(),
+            Origin::IncomingUnknownFrom,
+        )
+        .await
+        .unwrap();
         assert!(!contact_id.is_special());
         assert_eq!(sth_modified, Modifier::Created);
         let contact = Contact::load_from_db(&t, contact_id).await.unwrap();
@@ -2050,10 +2156,14 @@ mod tests {
         assert_eq!(contact.get_display_name(), "bob1");
 
         // incoming mail `From: bob2 <bob@example.org>` - this should update authname
-        let (contact_id, sth_modified) =
-            Contact::add_or_lookup(&t, "bob2", "bob@example.org", Origin::IncomingUnknownFrom)
-                .await
-                .unwrap();
+        let (contact_id, sth_modified) = Contact::add_or_lookup(
+            &t,
+            "bob2",
+            ContactAddress::new("bob@example.org").unwrap(),
+            Origin::IncomingUnknownFrom,
+        )
+        .await
+        .unwrap();
         assert!(!contact_id.is_special());
         assert_eq!(sth_modified, Modifier::Modified);
         let contact = Contact::load_from_db(&t, contact_id).await.unwrap();
@@ -2072,10 +2182,14 @@ mod tests {
         assert_eq!(contact.get_display_name(), "bob3");
 
         // incoming mail `From: bob4 <bob@example.org>` - this should update authname, manually given name is still "bob3"
-        let (contact_id, sth_modified) =
-            Contact::add_or_lookup(&t, "bob4", "bob@example.org", Origin::IncomingUnknownFrom)
-                .await
-                .unwrap();
+        let (contact_id, sth_modified) = Contact::add_or_lookup(
+            &t,
+            "bob4",
+            ContactAddress::new("bob@example.org").unwrap(),
+            Origin::IncomingUnknownFrom,
+        )
+        .await
+        .unwrap();
         assert!(!contact_id.is_special());
         assert_eq!(sth_modified, Modifier::Modified);
         let contact = Contact::load_from_db(&t, contact_id).await.unwrap();
@@ -2100,7 +2214,7 @@ mod tests {
         let (contact_id_same, sth_modified) = Contact::add_or_lookup(
             &t,
             "claire1",
-            "claire@example.org",
+            ContactAddress::new("claire@example.org").unwrap(),
             Origin::IncomingUnknownFrom,
         )
         .await
@@ -2116,7 +2230,7 @@ mod tests {
         let (contact_id_same, sth_modified) = Contact::add_or_lookup(
             &t,
             "claire2",
-            "claire@example.org",
+            ContactAddress::new("claire@example.org").unwrap(),
             Origin::IncomingUnknownFrom,
         )
         .await
@@ -2138,26 +2252,38 @@ mod tests {
         let t = TestContext::new().await;
 
         // Incoming message from Bob.
-        let (contact_id, sth_modified) =
-            Contact::add_or_lookup(&t, "Bob", "bob@example.org", Origin::IncomingUnknownFrom)
-                .await?;
+        let (contact_id, sth_modified) = Contact::add_or_lookup(
+            &t,
+            "Bob",
+            ContactAddress::new("bob@example.org")?,
+            Origin::IncomingUnknownFrom,
+        )
+        .await?;
         assert_eq!(sth_modified, Modifier::Created);
         let contact = Contact::load_from_db(&t, contact_id).await?;
         assert_eq!(contact.get_display_name(), "Bob");
 
         // Incoming message from someone else with "Not Bob" <bob@example.org> in the "To:" field.
-        let (contact_id_same, sth_modified) =
-            Contact::add_or_lookup(&t, "Not Bob", "bob@example.org", Origin::IncomingUnknownTo)
-                .await?;
+        let (contact_id_same, sth_modified) = Contact::add_or_lookup(
+            &t,
+            "Not Bob",
+            ContactAddress::new("bob@example.org")?,
+            Origin::IncomingUnknownTo,
+        )
+        .await?;
         assert_eq!(contact_id, contact_id_same);
         assert_eq!(sth_modified, Modifier::Modified);
         let contact = Contact::load_from_db(&t, contact_id).await?;
         assert_eq!(contact.get_display_name(), "Not Bob");
 
         // Incoming message from Bob, changing the name back.
-        let (contact_id_same, sth_modified) =
-            Contact::add_or_lookup(&t, "Bob", "bob@example.org", Origin::IncomingUnknownFrom)
-                .await?;
+        let (contact_id_same, sth_modified) = Contact::add_or_lookup(
+            &t,
+            "Bob",
+            ContactAddress::new("bob@example.org")?,
+            Origin::IncomingUnknownFrom,
+        )
+        .await?;
         assert_eq!(contact_id, contact_id_same);
         assert_eq!(sth_modified, Modifier::Modified); // This was None until the bugfix
         let contact = Contact::load_from_db(&t, contact_id).await?;
@@ -2180,9 +2306,14 @@ mod tests {
         assert_eq!(contact.get_display_name(), "dave1");
 
         // incoming mail `From: dave2 <dave@example.org>` - this should update authname
-        Contact::add_or_lookup(&t, "dave2", "dave@example.org", Origin::IncomingUnknownFrom)
-            .await
-            .unwrap();
+        Contact::add_or_lookup(
+            &t,
+            "dave2",
+            ContactAddress::new("dave@example.org").unwrap(),
+            Origin::IncomingUnknownFrom,
+        )
+        .await
+        .unwrap();
         let contact = Contact::load_from_db(&t, contact_id).await.unwrap();
         assert_eq!(contact.get_authname(), "dave2");
         assert_eq!(contact.get_name(), "dave1");
@@ -2296,9 +2427,13 @@ mod tests {
         let encrinfo = Contact::get_encrinfo(&alice, ContactId::DEVICE).await;
         assert!(encrinfo.is_err());
 
-        let (contact_bob_id, _modified) =
-            Contact::add_or_lookup(&alice, "Bob", "bob@example.net", Origin::ManuallyCreated)
-                .await?;
+        let (contact_bob_id, _modified) = Contact::add_or_lookup(
+            &alice,
+            "Bob",
+            ContactAddress::new("bob@example.net")?,
+            Origin::ManuallyCreated,
+        )
+        .await?;
 
         let encrinfo = Contact::get_encrinfo(&alice, contact_bob_id).await?;
         assert_eq!(encrinfo, "No encryption");
@@ -2455,9 +2590,13 @@ CCCB 5AA9 F6E1 141C 9431
     async fn test_last_seen() -> Result<()> {
         let alice = TestContext::new_alice().await;
 
-        let (contact_id, _) =
-            Contact::add_or_lookup(&alice, "Bob", "bob@example.net", Origin::ManuallyCreated)
-                .await?;
+        let (contact_id, _) = Contact::add_or_lookup(
+            &alice,
+            "Bob",
+            ContactAddress::new("bob@example.net")?,
+            Origin::ManuallyCreated,
+        )
+        .await?;
         let contact = Contact::load_from_db(&alice, contact_id).await?;
         assert_eq!(contact.last_seen(), 0);
 
@@ -2501,6 +2640,29 @@ Hi."#;
 
         let self_contact = Contact::get_by_id(&bob, ContactId::SELF).await?;
         assert!(!self_contact.was_seen_recently());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_verified_by_none() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let alice = tcm.alice().await;
+        let bob = tcm.bob().await;
+
+        let contact_id = Contact::create(&alice, "Bob", "bob@example.net").await?;
+        let contact = Contact::get_by_id(&alice, contact_id).await?;
+        assert!(contact.get_verifier_addr(&alice).await?.is_none());
+        assert!(contact.get_verifier_id(&alice).await?.is_none());
+
+        // Receive a message from Bob to create a peerstate.
+        let chat = bob.create_chat(&alice).await;
+        let sent_msg = bob.send_text(chat.id, "moin").await;
+        alice.recv_msg(&sent_msg).await;
+
+        let contact = Contact::get_by_id(&alice, contact_id).await?;
+        assert!(contact.get_verifier_addr(&alice).await?.is_none());
+        assert!(contact.get_verifier_id(&alice).await?.is_none());
 
         Ok(())
     }

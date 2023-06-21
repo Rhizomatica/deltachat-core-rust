@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 from typing import AsyncGenerator, List, Optional
@@ -12,9 +13,11 @@ from .rpc import Rpc
 async def get_temp_credentials() -> dict:
     url = os.getenv("DCC_NEW_TMP_EMAIL")
     assert url, "Failed to get online account, DCC_NEW_TMP_EMAIL is not set"
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url) as response:
-            return json.loads(await response.text())
+
+    # Replace default 5 minute timeout with a 1 minute timeout.
+    timeout = aiohttp.ClientTimeout(total=60)
+    async with aiohttp.ClientSession() as session, session.post(url, timeout=timeout) as response:
+        return json.loads(await response.text())
 
 
 class ACFactory:
@@ -48,11 +51,18 @@ class ACFactory:
         await bot.configure(credentials["email"], credentials["password"])
         return bot
 
+    async def get_online_account(self) -> Account:
+        account = await self.new_configured_account()
+        await account.start_io()
+        while True:
+            event = await account.wait_for_event()
+            print(event)
+            if event.type == EventType.IMAP_INBOX_IDLE:
+                break
+        return account
+
     async def get_online_accounts(self, num: int) -> List[Account]:
-        accounts = [await self.new_configured_account() for _ in range(num)]
-        for account in accounts:
-            await account.start_io()
-        return accounts
+        return await asyncio.gather(*[self.get_online_account() for _ in range(num)])
 
     async def send_message(
         self,
@@ -64,9 +74,7 @@ class ACFactory:
     ) -> Message:
         if not from_account:
             from_account = (await self.get_online_accounts(1))[0]
-        to_contact = await from_account.create_contact(
-            await to_account.get_config("addr")
-        )
+        to_contact = await from_account.create_contact(await to_account.get_config("addr"))
         if group:
             to_chat = await from_account.create_group(group)
             await to_chat.add_contact(to_contact)

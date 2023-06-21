@@ -1,19 +1,30 @@
+import asyncio
 from unittest.mock import MagicMock
 
 import pytest
-
 from deltachat_rpc_client import EventType, events
 from deltachat_rpc_client.rpc import JsonRpcError
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio()
 async def test_system_info(rpc) -> None:
     system_info = await rpc.get_system_info()
     assert "arch" in system_info
     assert "deltachat_core_version" in system_info
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio()
+async def test_sleep(rpc) -> None:
+    """Test that long-running task does not block short-running task from completion."""
+    sleep_5_task = asyncio.create_task(rpc.sleep(5.0))
+    sleep_3_task = asyncio.create_task(rpc.sleep(3.0))
+    done, pending = await asyncio.wait([sleep_5_task, sleep_3_task], return_when=asyncio.FIRST_COMPLETED)
+    assert sleep_3_task in done
+    assert sleep_5_task in pending
+    sleep_5_task.cancel()
+
+
+@pytest.mark.asyncio()
 async def test_email_address_validity(rpc) -> None:
     valid_addresses = [
         "email@example.com",
@@ -27,7 +38,7 @@ async def test_email_address_validity(rpc) -> None:
         assert not await rpc.check_email_validity(addr)
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio()
 async def test_acfactory(acfactory) -> None:
     account = await acfactory.new_configured_account()
     while True:
@@ -41,17 +52,18 @@ async def test_acfactory(acfactory) -> None:
     print("Successful configuration")
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio()
 async def test_configure_starttls(acfactory) -> None:
     account = await acfactory.new_preconfigured_account()
 
     # Use STARTTLS
     await account.set_config("mail_security", "2")
+    await account.set_config("send_security", "2")
     await account.configure()
     assert await account.is_configured()
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio()
 async def test_account(acfactory) -> None:
     alice, bob = await acfactory.get_online_accounts(2)
 
@@ -86,8 +98,8 @@ async def test_account(acfactory) -> None:
     assert await alice.get_chatlist()
     assert await alice.get_chatlist(snapshot=True)
     assert await alice.get_qr_code()
-    await alice.get_fresh_messages()
-    await alice.get_fresh_messages_in_arrival_order()
+    assert await alice.get_fresh_messages()
+    assert await alice.get_next_messages()
 
     group = await alice.create_group("test group")
     await group.add_contact(alice_contact_bob)
@@ -111,7 +123,7 @@ async def test_account(acfactory) -> None:
     await alice.stop_io()
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio()
 async def test_chat(acfactory) -> None:
     alice, bob = await acfactory.get_online_accounts(2)
 
@@ -135,7 +147,9 @@ async def test_chat(acfactory) -> None:
     assert alice_chat_bob != bob_chat_alice
     assert repr(alice_chat_bob)
     await alice_chat_bob.delete()
+    assert not await bob_chat_alice.can_send()
     await bob_chat_alice.accept()
+    assert await bob_chat_alice.can_send()
     await bob_chat_alice.block()
     bob_chat_alice = await snapshot.sender.create_chat()
     await bob_chat_alice.mute()
@@ -177,7 +191,7 @@ async def test_chat(acfactory) -> None:
     await group.get_locations()
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio()
 async def test_contact(acfactory) -> None:
     alice, bob = await acfactory.get_online_accounts(2)
 
@@ -195,7 +209,7 @@ async def test_contact(acfactory) -> None:
     await alice_contact_bob.create_chat()
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio()
 async def test_message(acfactory) -> None:
     alice, bob = await acfactory.get_online_accounts(2)
 
@@ -215,6 +229,7 @@ async def test_message(acfactory) -> None:
     snapshot = await message.get_snapshot()
     assert snapshot.chat_id == chat_id
     assert snapshot.text == "Hello!"
+    assert not snapshot.is_bot
     assert repr(message)
 
     with pytest.raises(JsonRpcError):  # chat is not accepted
@@ -224,46 +239,99 @@ async def test_message(acfactory) -> None:
 
     await message.mark_seen()
     await message.send_reaction("😎")
+    reactions = await message.get_reactions()
+    assert reactions
+    snapshot = await message.get_snapshot()
+    assert reactions == snapshot.reactions
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio()
+async def test_is_bot(acfactory) -> None:
+    """Test that we can recognize messages submitted by bots."""
+    alice, bob = await acfactory.get_online_accounts(2)
+
+    bob_addr = await bob.get_config("addr")
+    alice_contact_bob = await alice.create_contact(bob_addr, "Bob")
+    alice_chat_bob = await alice_contact_bob.create_chat()
+
+    # Alice becomes a bot.
+    await alice.set_config("bot", "1")
+    await alice_chat_bob.send_text("Hello!")
+
+    while True:
+        event = await bob.wait_for_event()
+        if event.type == EventType.INCOMING_MSG:
+            msg_id = event.msg_id
+            message = bob.get_message_by_id(msg_id)
+            snapshot = await message.get_snapshot()
+            assert snapshot.chat_id == event.chat_id
+            assert snapshot.text == "Hello!"
+            assert snapshot.is_bot
+            break
+
+
+@pytest.mark.asyncio()
 async def test_bot(acfactory) -> None:
     mock = MagicMock()
     user = (await acfactory.get_online_accounts(1))[0]
     bot = await acfactory.new_configured_bot()
+    bot2 = await acfactory.new_configured_bot()
 
     assert await bot.is_configured()
     assert await bot.account.get_config("bot") == "1"
 
-    hook = lambda e: mock.hook(e.msg_id), events.RawEvent(EventType.INCOMING_MSG)
+    hook = lambda e: mock.hook(e.msg_id) and None, events.RawEvent(EventType.INCOMING_MSG)
     bot.add_hook(*hook)
-    event = await acfactory.process_message(
-        from_account=user, to_client=bot, text="Hello!"
-    )
+    event = await acfactory.process_message(from_account=user, to_client=bot, text="Hello!")
+    snapshot = await bot.account.get_message_by_id(event.msg_id).get_snapshot()
+    assert not snapshot.is_bot
     mock.hook.assert_called_once_with(event.msg_id)
     bot.remove_hook(*hook)
 
-    track = lambda e: mock.hook(e.message_snapshot.id)
+    def track(e):
+        mock.hook(e.message_snapshot.id)
 
     mock.hook.reset_mock()
     hook = track, events.NewMessage(r"hello")
     bot.add_hook(*hook)
     bot.add_hook(track, events.NewMessage(command="/help"))
-    event = await acfactory.process_message(
-        from_account=user, to_client=bot, text="hello"
-    )
+    event = await acfactory.process_message(from_account=user, to_client=bot, text="hello")
     mock.hook.assert_called_with(event.msg_id)
-    event = await acfactory.process_message(
-        from_account=user, to_client=bot, text="hello!"
-    )
+    event = await acfactory.process_message(from_account=user, to_client=bot, text="hello!")
     mock.hook.assert_called_with(event.msg_id)
+    await acfactory.process_message(from_account=bot2.account, to_client=bot, text="hello")
+    assert len(mock.hook.mock_calls) == 2  # bot messages are ignored between bots
     await acfactory.process_message(from_account=user, to_client=bot, text="hey!")
     assert len(mock.hook.mock_calls) == 2
     bot.remove_hook(*hook)
 
     mock.hook.reset_mock()
     await acfactory.process_message(from_account=user, to_client=bot, text="hello")
-    event = await acfactory.process_message(
-        from_account=user, to_client=bot, text="/help"
-    )
+    event = await acfactory.process_message(from_account=user, to_client=bot, text="/help")
     mock.hook.assert_called_once_with(event.msg_id)
+
+
+@pytest.mark.asyncio()
+async def test_wait_next_messages(acfactory) -> None:
+    alice = await acfactory.new_configured_account()
+
+    # Create a bot account so it does not receive device messages in the beginning.
+    bot = await acfactory.new_preconfigured_account()
+    await bot.set_config("bot", "1")
+    await bot.configure()
+
+    # There are no old messages and the call returns immediately.
+    assert not await bot.wait_next_messages()
+
+    # Bot starts waiting for messages.
+    next_messages_task = asyncio.create_task(bot.wait_next_messages())
+
+    bot_addr = await bot.get_config("addr")
+    alice_contact_bot = await alice.create_contact(bot_addr, "Bob")
+    alice_chat_bot = await alice_contact_bot.create_chat()
+    await alice_chat_bot.send_text("Hello!")
+
+    next_messages = await next_messages_task
+    assert len(next_messages) == 1
+    snapshot = await next_messages[0].get_snapshot()
+    assert snapshot.text == "Hello!"

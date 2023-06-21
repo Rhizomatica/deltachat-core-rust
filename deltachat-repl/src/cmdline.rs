@@ -29,13 +29,13 @@ use tokio::fs;
 
 /// Reset database tables.
 /// Argument is a bitmask, executing single or multiple actions in one call.
-/// e.g. bitmask 7 triggers actions definded with bits 1, 2 and 4.
+/// e.g. bitmask 7 triggers actions defined with bits 1, 2 and 4.
 async fn reset_tables(context: &Context, bits: i32) {
-    println!("Resetting tables ({})...", bits);
+    println!("Resetting tables ({bits})...");
     if 0 != bits & 1 {
         context
             .sql()
-            .execute("DELETE FROM jobs;", paramsv![])
+            .execute("DELETE FROM jobs;", ())
             .await
             .unwrap();
         println!("(1) Jobs reset.");
@@ -43,7 +43,7 @@ async fn reset_tables(context: &Context, bits: i32) {
     if 0 != bits & 2 {
         context
             .sql()
-            .execute("DELETE FROM acpeerstates;", paramsv![])
+            .execute("DELETE FROM acpeerstates;", ())
             .await
             .unwrap();
         println!("(2) Peerstates reset.");
@@ -51,7 +51,7 @@ async fn reset_tables(context: &Context, bits: i32) {
     if 0 != bits & 4 {
         context
             .sql()
-            .execute("DELETE FROM keypairs;", paramsv![])
+            .execute("DELETE FROM keypairs;", ())
             .await
             .unwrap();
         println!("(4) Private keypairs reset.");
@@ -59,36 +59,36 @@ async fn reset_tables(context: &Context, bits: i32) {
     if 0 != bits & 8 {
         context
             .sql()
-            .execute("DELETE FROM contacts WHERE id>9;", paramsv![])
+            .execute("DELETE FROM contacts WHERE id>9;", ())
             .await
             .unwrap();
         context
             .sql()
-            .execute("DELETE FROM chats WHERE id>9;", paramsv![])
+            .execute("DELETE FROM chats WHERE id>9;", ())
             .await
             .unwrap();
         context
             .sql()
-            .execute("DELETE FROM chats_contacts;", paramsv![])
+            .execute("DELETE FROM chats_contacts;", ())
             .await
             .unwrap();
         context
             .sql()
-            .execute("DELETE FROM msgs WHERE id>9;", paramsv![])
+            .execute("DELETE FROM msgs WHERE id>9;", ())
             .await
             .unwrap();
         context
             .sql()
             .execute(
                 "DELETE FROM config WHERE keyname LIKE 'imap.%' OR keyname LIKE 'configured%';",
-                paramsv![],
+                (),
             )
             .await
             .unwrap();
         context.sql().config_cache().write().await.clear();
         context
             .sql()
-            .execute("DELETE FROM leftgrps;", paramsv![])
+            .execute("DELETE FROM leftgrps;", ())
             .await
             .unwrap();
         println!("(8) Rest but server config reset.");
@@ -101,7 +101,7 @@ async fn poke_eml_file(context: &Context, filename: impl AsRef<Path>) -> Result<
     let data = read_file(context, filename).await?;
 
     if let Err(err) = receive_imf(context, &data, false).await {
-        println!("receive_imf errored: {:?}", err);
+        println!("receive_imf errored: {err:?}");
     }
     Ok(())
 }
@@ -148,7 +148,7 @@ async fn poke_spec(context: &Context, spec: Option<&str>) -> bool {
                 let name = name_f.to_string_lossy();
                 if name.ends_with(".eml") {
                     let path_plus_name = format!("{}/{}", &real_spec, name);
-                    println!("Import: {}", path_plus_name);
+                    println!("Import: {path_plus_name}");
                     if poke_eml_file(context, path_plus_name).await.is_ok() {
                         read_cnt += 1
                     }
@@ -168,7 +168,7 @@ async fn log_msg(context: &Context, prefix: impl AsRef<str>, msg: &Message) {
         .await
         .expect("invalid contact");
     let contact_name = if let Some(name) = msg.get_override_sender_name() {
-        format!("~{}", name)
+        format!("~{name}")
     } else {
         contact.get_display_name().to_string()
     };
@@ -223,7 +223,7 @@ async fn log_msg(context: &Context, prefix: impl AsRef<str>, msg: &Message) {
                     "[WEBXDC: {}, icon={}, document={}, summary={}, source_code_url={}]",
                     info.name, info.icon, info.document, info.summary, info.source_code_url
                 ),
-                Err(err) => format!("[get_webxdc_info() failed: {}]", err),
+                Err(err) => format!("[get_webxdc_info() failed: {err}]"),
             }
         } else {
             "".to_string()
@@ -336,6 +336,8 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                  has-backup\n\
                  export-backup\n\
                  import-backup <backup-file>\n\
+                 send-backup\n\
+                 receive-backup <qr>\n\
                  export-keys\n\
                  import-keys\n\
                  export-setup\n\
@@ -435,10 +437,9 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             ),
         },
         "initiate-key-transfer" => match initiate_key_transfer(&context).await {
-            Ok(setup_code) => println!(
-                "Setup code for the transferred setup message: {}",
-                setup_code,
-            ),
+            Ok(setup_code) => {
+                println!("Setup code for the transferred setup message: {setup_code}",)
+            }
             Err(err) => bail!("Failed to generate setup code: {}", err),
         },
         "get-setupcodebegin" => {
@@ -487,6 +488,17 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             )
             .await?;
         }
+        "send-backup" => {
+            let provider = BackupProvider::prepare(&context).await?;
+            let qr = provider.qr();
+            println!("QR code: {}", format_backup(&qr)?);
+            provider.await?;
+        }
+        "receive-backup" => {
+            ensure!(!arg1.is_empty(), "Argument <qr> is missing.");
+            let qr = check_qr(&context, arg1).await?;
+            deltachat::imex::get_backup(&context, qr).await?;
+        }
         "export-keys" => {
             let dir = dirs::home_dir().unwrap_or_default();
             imex(&context, ImexMode::ExportSelfKeys, dir.as_ref(), None).await?;
@@ -528,7 +540,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             ensure!(!arg1.is_empty(), "Argument <key> missing.");
             let key = config::Config::from_str(arg1)?;
             let val = context.get_config(key).await;
-            println!("{}={:?}", key, val);
+            println!("{key}={val:?}");
         }
         "info" => {
             println!("{:#?}", context.get_info().await);
@@ -540,7 +552,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             match context.get_connectivity_html().await {
                 Ok(html) => {
                     fs::write(&file, html).await?;
-                    println!("Report written to: {:#?}", file);
+                    println!("Report written to: {file:#?}");
                 }
                 Err(err) => {
                     bail!("Failed to get connectivity html: {}", err);
@@ -551,7 +563,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             context.maybe_network().await;
         }
         "housekeeping" => {
-            sql::housekeeping(&context).await.ok_or_log(&context);
+            sql::housekeeping(&context).await.log_err(&context).ok();
         }
         "listchats" | "listarchived" | "chats" => {
             let listflags = if arg0 == "listarchived" {
@@ -613,7 +625,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                         "{}{}{} [{}]{}",
                         summary
                             .prefix
-                            .map_or_else(String::new, |prefix| format!("{}: ", prefix)),
+                            .map_or_else(String::new, |prefix| format!("{prefix}: ")),
                         summary.text,
                         statestr,
                         &timestr,
@@ -631,8 +643,8 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             if location::is_sending_locations_to_chat(&context, None).await? {
                 println!("Location streaming enabled.");
             }
-            println!("{} chats", cnt);
-            println!("{:?} to create this list", time_needed);
+            println!("{cnt} chats");
+            println!("{time_needed:?} to create this list");
         }
         "chat" => {
             if sel_chat.is_none() && arg1.is_empty() {
@@ -640,7 +652,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             }
             if !arg1.is_empty() {
                 let id = ChatId::new(arg1.parse()?);
-                println!("Selecting chat {}", id);
+                println!("Selecting chat {id}");
                 sel_chat = Some(Chat::load_from_db(&context, id).await?);
                 *chat_id = id;
             }
@@ -649,8 +661,15 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             let sel_chat = sel_chat.as_ref().unwrap();
 
             let time_start = std::time::SystemTime::now();
-            let msglist =
-                chat::get_chat_msgs(&context, sel_chat.get_id(), DC_GCM_ADDDAYMARKER).await?;
+            let msglist = chat::get_chat_msgs_ex(
+                &context,
+                sel_chat.get_id(),
+                chat::MessageListOptions {
+                    info_only: false,
+                    add_daymarker: true,
+                },
+            )
+            .await?;
             let time_needed = time_start.elapsed().unwrap_or_default();
 
             let msglist: Vec<MsgId> = msglist
@@ -686,7 +705,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                 },
                 match sel_chat.get_profile_image(&context).await? {
                     Some(icon) => match icon.to_str() {
-                        Some(icon) => format!(" Icon: {}", icon),
+                        Some(icon) => format!(" Icon: {icon}"),
                         _ => " Icon: Err".to_string(),
                     },
                     _ => "".to_string(),
@@ -712,8 +731,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             let time_noticed_needed = time_noticed_start.elapsed().unwrap_or_default();
 
             println!(
-                "{:?} to create this list, {:?} to mark all messages as noticed.",
-                time_needed, time_noticed_needed
+                "{time_needed:?} to create this list, {time_noticed_needed:?} to mark all messages as noticed."
             );
         }
         "createchat" => {
@@ -721,26 +739,26 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             let contact_id = ContactId::new(arg1.parse()?);
             let chat_id = ChatId::create_for_contact(&context, contact_id).await?;
 
-            println!("Single#{} created successfully.", chat_id,);
+            println!("Single#{chat_id} created successfully.",);
         }
         "creategroup" => {
             ensure!(!arg1.is_empty(), "Argument <name> missing.");
             let chat_id =
                 chat::create_group_chat(&context, ProtectionStatus::Unprotected, arg1).await?;
 
-            println!("Group#{} created successfully.", chat_id);
+            println!("Group#{chat_id} created successfully.");
         }
         "createbroadcast" => {
             let chat_id = chat::create_broadcast_list(&context).await?;
 
-            println!("Broadcast#{} created successfully.", chat_id);
+            println!("Broadcast#{chat_id} created successfully.");
         }
         "createprotected" => {
             ensure!(!arg1.is_empty(), "Argument <name> missing.");
             let chat_id =
                 chat::create_group_chat(&context, ProtectionStatus::Protected, arg1).await?;
 
-            println!("Group#{} created and protected successfully.", chat_id);
+            println!("Group#{chat_id} created and protected successfully.");
         }
         "addmember" => {
             ensure!(sel_chat.is_some(), "No chat selected");
@@ -770,7 +788,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             chat::set_chat_name(
                 &context,
                 sel_chat.as_ref().unwrap().get_id(),
-                format!("{} {}", arg1, arg2).trim(),
+                format!("{arg1} {arg2}").trim(),
             )
             .await?;
 
@@ -864,7 +882,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             if continue_streaming {
                 println!("Success, streaming should be continued.");
             } else {
-                println!("Success, streaming can be stoppped.");
+                println!("Success, streaming can be stopped.");
             }
         }
         "dellocations" => {
@@ -874,7 +892,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             ensure!(sel_chat.is_some(), "No chat selected.");
             ensure!(!arg1.is_empty(), "No message text given.");
 
-            let msg = format!("{} {}", arg1, arg2);
+            let msg = format!("{arg1} {arg2}");
 
             chat::send_text_msg(&context, sel_chat.as_ref().unwrap().get_id(), msg).await?;
         }
@@ -916,7 +934,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             chat::send_msg(&context, sel_chat.as_ref().unwrap().get_id(), &mut msg).await?;
         }
         "sendsyncmsg" => match context.send_sync_msg().await? {
-            Some(msg_id) => println!("sync message sent as {}.", msg_id),
+            Some(msg_id) => println!("sync message sent as {msg_id}."),
             None => println!("sync message not needed."),
         },
         "sendupdate" => {
@@ -936,7 +954,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
         "listmsgs" => {
             ensure!(!arg1.is_empty(), "Argument <query> missing.");
 
-            let query = format!("{} {}", arg1, arg2).trim().to_string();
+            let query = format!("{arg1} {arg2}").trim().to_string();
             let chat = sel_chat.as_ref().map(|sel_chat| sel_chat.get_id());
             let time_start = std::time::SystemTime::now();
             let msglist = context.search_msgs(chat, &query).await?;
@@ -954,7 +972,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                 },
                 query,
             );
-            println!("{:?} to create this list", time_needed);
+            println!("{time_needed:?} to create this list");
         }
         "draft" => {
             ensure!(sel_chat.is_some(), "No chat selected.");
@@ -1000,9 +1018,9 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             println!("{} images or videos: ", images.len());
             for (i, data) in images.iter().enumerate() {
                 if 0 == i {
-                    print!("{}", data);
+                    print!("{data}");
                 } else {
-                    print!(", {}", data);
+                    print!(", {data}");
                 }
             }
             println!();
@@ -1073,12 +1091,12 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             ensure!(!arg1.is_empty(), "Argument <msg-id> missing.");
             let id = MsgId::new(arg1.parse()?);
             let res = message::get_msg_info(&context, id).await?;
-            println!("{}", res);
+            println!("{res}");
         }
         "download" => {
             ensure!(!arg1.is_empty(), "Argument <msg-id> missing.");
             let id = MsgId::new(arg1.parse()?);
-            println!("Scheduling download for {:?}", id);
+            println!("Scheduling download for {id:?}");
             id.download_full(&context).await?;
         }
         "html" => {
@@ -1089,7 +1107,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                 .join(format!("msg-{}.html", id.to_u32()));
             let html = id.get_html(&context).await?.unwrap_or_default();
             fs::write(&file, html).await?;
-            println!("HTML written to: {:#?}", file);
+            println!("HTML written to: {file:#?}");
         }
         "listfresh" => {
             let msglist = context.get_fresh_msgs().await?;
@@ -1151,7 +1169,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             ensure!(!arg1.is_empty(), "Arguments [<name>] <addr> expected.");
 
             if !arg2.is_empty() {
-                let book = format!("{}\n{}", arg1, arg2);
+                let book = format!("{arg1}\n{arg2}");
                 Contact::add_address_book(&context, &book).await?;
             } else {
                 Contact::create(&context, "", arg1).await?;
@@ -1178,10 +1196,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             let chatlist = Chatlist::try_load(&context, 0, None, Some(contact_id)).await?;
             let chatlist_cnt = chatlist.len();
             if chatlist_cnt > 0 {
-                res += &format!(
-                    "\n\n{} chats shared with Contact#{}: ",
-                    chatlist_cnt, contact_id,
-                );
+                res += &format!("\n\n{chatlist_cnt} chats shared with Contact#{contact_id}: ",);
                 for i in 0..chatlist_cnt {
                     if 0 != i {
                         res += ", ";
@@ -1191,7 +1206,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                 }
             }
 
-            println!("{}", res);
+            println!("{res}");
         }
         "delcontact" => {
             ensure!(!arg1.is_empty(), "Argument <contact-id> missing.");
@@ -1215,13 +1230,13 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
         "checkqr" => {
             ensure!(!arg1.is_empty(), "Argument <qr-content> missing.");
             let qr = check_qr(&context, arg1).await?;
-            println!("qr={:?}", qr);
+            println!("qr={qr:?}");
         }
         "setqr" => {
             ensure!(!arg1.is_empty(), "Argument <qr-content> missing.");
             match set_config_from_qr(&context, arg1).await {
                 Ok(()) => println!("Config set from QR code, you can now call 'configure'"),
-                Err(err) => println!("Cannot set config from QR code: {:?}", err),
+                Err(err) => println!("Cannot set config from QR code: {err:?}"),
             }
         }
         "providerinfo" => {
@@ -1231,7 +1246,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                 .await?;
             match provider::get_provider_info(&context, arg1, socks5_enabled).await {
                 Some(info) => {
-                    println!("Information for provider belonging to {}:", arg1);
+                    println!("Information for provider belonging to {arg1}:");
                     println!("status: {}", info.status as u32);
                     println!("before_login_hint: {}", info.before_login_hint);
                     println!("after_login_hint: {}", info.after_login_hint);
@@ -1241,7 +1256,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                     }
                 }
                 None => {
-                    println!("No information for provider belonging to {} found.", arg1);
+                    println!("No information for provider belonging to {arg1} found.");
                 }
             }
         }
@@ -1250,7 +1265,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
 
             if let Ok(buf) = read_file(&context, &arg1).await {
                 let (width, height) = get_filemeta(&buf)?;
-                println!("width={}, height={}", width, height);
+                println!("width={width}, height={height}");
             } else {
                 bail!("Command failed.");
             }
@@ -1261,8 +1276,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             let device_cnt = message::estimate_deletion_cnt(&context, false, seconds).await?;
             let server_cnt = message::estimate_deletion_cnt(&context, true, seconds).await?;
             println!(
-                "estimated count of messages older than {} seconds:\non device: {}\non server: {}",
-                seconds, device_cnt, server_cnt
+                "estimated count of messages older than {seconds} seconds:\non device: {device_cnt}\non server: {server_cnt}"
             );
         }
         "" => (),

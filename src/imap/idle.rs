@@ -1,13 +1,13 @@
-use super::Imap;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context as _, Result};
 use async_channel::Receiver;
 use async_imap::extensions::idle::IdleResponse;
 use futures_lite::FutureExt;
-use std::time::{Duration, SystemTime};
 
 use super::session::Session;
-use crate::imap::client::IMAP_TIMEOUT;
+use super::Imap;
+use crate::imap::{client::IMAP_TIMEOUT, FolderMeaning};
 use crate::{context::Context, scheduler::InterruptInfo};
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(23 * 60);
@@ -99,8 +99,8 @@ impl Session {
 
         let mut session = tokio::time::timeout(Duration::from_secs(15), handle.done())
             .await
-            .with_context(|| format!("{}: IMAP IDLE protocol timed out", folder_name))?
-            .with_context(|| format!("{}: IMAP IDLE failed", folder_name))?;
+            .with_context(|| format!("{folder_name}: IMAP IDLE protocol timed out"))?
+            .with_context(|| format!("{folder_name}: IMAP IDLE failed"))?;
         session.as_mut().set_read_timeout(Some(IMAP_TIMEOUT));
         self.inner = session;
 
@@ -113,6 +113,7 @@ impl Imap {
         &mut self,
         context: &Context,
         watch_folder: Option<String>,
+        folder_meaning: FolderMeaning,
     ) -> InterruptInfo {
         // Idle using polling. This is also needed if we're not yet configured -
         // in this case, we're waiting for a configure job (and an interrupt).
@@ -173,7 +174,7 @@ impl Imap {
                     // will have already fetched the messages so perform_*_fetch
                     // will not find any new.
                     match self
-                        .fetch_new_messages(context, &watch_folder, false, false)
+                        .fetch_new_messages(context, &watch_folder, folder_meaning, false)
                         .await
                     {
                         Ok(res) => {

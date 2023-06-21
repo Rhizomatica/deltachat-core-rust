@@ -1,5 +1,3 @@
-use tempfile::tempdir;
-
 use deltachat::chat::{self, ChatId};
 use deltachat::chatlist::*;
 use deltachat::config;
@@ -8,6 +6,7 @@ use deltachat::context::*;
 use deltachat::message::Message;
 use deltachat::stock_str::StockStrings;
 use deltachat::{EventType, Events};
+use tempfile::tempdir;
 
 fn cb(event: EventType) {
     match event {
@@ -29,7 +28,7 @@ fn cb(event: EventType) {
     }
 }
 
-/// Run with `RUST_LOG=simple=info cargo run --release --example simple --features repl -- email pw`.
+/// Run with `RUST_LOG=simple=info cargo run --release --example simple -- email pw`.
 #[tokio::main]
 async fn main() {
     pretty_env_logger::try_init_timed().ok();
@@ -75,7 +74,7 @@ async fn main() {
 
     for i in 0..1 {
         log::info!("sending message {}", i);
-        chat::send_text_msg(&ctx, chat_id, format!("Hi, here is my {}nth message!", i))
+        chat::send_text_msg(&ctx, chat_id, format!("Hi, here is my {i}nth message!"))
             .await
             .unwrap();
     }

@@ -1,9 +1,11 @@
 use tokio::fs;
 
 use super::*;
-
 use crate::aheader::EncryptPreference;
-use crate::chat::get_chat_contacts;
+use crate::chat::{
+    add_contact_to_chat, add_to_chat_contacts_table, create_group_chat, get_chat_contacts,
+    is_contact_in_chat, remove_contact_from_chat, send_text_msg,
+};
 use crate::chat::{get_chat_msgs, ChatItem, ChatVisibility};
 use crate::chatlist::Chatlist;
 use crate::constants::DC_GCL_NO_SPECIALS;
@@ -21,7 +23,7 @@ async fn test_grpid_simple() {
                     References: <Gr.HcxyMARjyJy.9-uvzWPTLtV@nauta.cu>\n\
                     \n\
                     hello\x00";
-    let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..])
+    let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..], None)
         .await
         .unwrap();
     assert_eq!(extract_grpid(&mimeparser, HeaderDef::InReplyTo), None);
@@ -39,7 +41,7 @@ async fn test_bad_from() {
                     References: <Gr.HcxyMARjyJy.9-uvzWPTLtV@nauta.cu>\n\
                     \n\
                     hello\x00";
-    let mimeparser = MimeMessage::from_bytes_with_partial(&context.ctx, &raw[..], None).await;
+    let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..], None).await;
     assert!(mimeparser.is_err());
 }
 
@@ -53,7 +55,7 @@ async fn test_grpid_from_multiple() {
                     References: <qweqweqwe>, <Gr.HcxyMARjyJy.9-uvzWPTLtV@nau.ca>\n\
                     \n\
                     hello\x00";
-    let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..])
+    let mimeparser = MimeMessage::from_bytes(&context.ctx, &raw[..], None)
         .await
         .unwrap();
     let grpid = Some("HcxyMARjyJy");
@@ -95,7 +97,7 @@ static GRP_MAIL: &[u8] =
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_adhoc_group_show_chats_only() {
     let t = TestContext::new_alice().await;
-    assert_eq!(t.get_config_int(Config::ShowEmails).await.unwrap(), 0);
+    t.set_config(Config::ShowEmails, Some("0")).await.unwrap();
 
     let chats = Chatlist::try_load(&t, 0, None, None).await.unwrap();
     assert_eq!(chats.len(), 0);
@@ -155,12 +157,12 @@ async fn test_adhoc_group_show_accepted_contact_accepted() {
     assert_eq!(chat.typ, Chattype::Single);
     assert_eq!(chat.name, "Bob");
     assert_eq!(chat::get_chat_contacts(&t, chat_id).await.unwrap().len(), 1);
-    assert_eq!(chat::get_chat_msgs(&t, chat_id, 0).await.unwrap().len(), 1);
+    assert_eq!(chat::get_chat_msgs(&t, chat_id).await.unwrap().len(), 1);
 
     // receive a non-delta-message from Bob, shows up because of the show_emails setting
     receive_imf(&t, ONETOONE_NOREPLY_MAIL, false).await.unwrap();
 
-    assert_eq!(chat::get_chat_msgs(&t, chat_id, 0).await.unwrap().len(), 2);
+    assert_eq!(chat::get_chat_msgs(&t, chat_id).await.unwrap().len(), 2);
 
     // let Bob create an adhoc-group by a non-delta-message, shows up because of the show_emails setting
     receive_imf(&t, GRP_MAIL, false).await.unwrap();
@@ -176,7 +178,7 @@ async fn test_adhoc_group_show_accepted_contact_accepted() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_adhoc_group_show_all() {
     let t = TestContext::new_alice().await;
-    t.set_config(Config::ShowEmails, Some("2")).await.unwrap();
+    assert_eq!(t.get_config_int(Config::ShowEmails).await.unwrap(), 2);
     receive_imf(&t, GRP_MAIL, false).await.unwrap();
 
     // adhoc-group with unknown contacts with show_emails=all will show up in a single chat
@@ -209,7 +211,7 @@ async fn test_read_receipt_and_unarchive() -> Result<()> {
     // create a group with bob, archive group
     let group_id = chat::create_group_chat(&t, ProtectionStatus::Unprotected, "foo").await?;
     chat::add_contact_to_chat(&t, group_id, bob_id).await?;
-    assert_eq!(chat::get_chat_msgs(&t, group_id, 0).await.unwrap().len(), 0);
+    assert_eq!(chat::get_chat_msgs(&t, group_id).await.unwrap().len(), 0);
     group_id
         .set_visibility(&t, ChatVisibility::Archived)
         .await?;
@@ -290,7 +292,7 @@ async fn test_read_receipt_and_unarchive() -> Result<()> {
             false,
         )
         .await?;
-    assert_eq!(chat::get_chat_msgs(&t, group_id, 0).await?.len(), 1);
+    assert_eq!(chat::get_chat_msgs(&t, group_id).await?.len(), 1);
     let msg = message::Message::load_from_db(&t, msg.id).await?;
     assert_eq!(msg.state, MessageState::OutMdnRcvd);
 
@@ -368,14 +370,13 @@ async fn test_no_message_id_header() {
     )
     .await
     .unwrap();
-    dbg!(&received);
     assert!(received.is_none());
 
     assert!(!t
         .sql
         .exists(
             "SELECT COUNT(*) FROM msgs WHERE chat_id=?;",
-            paramsv![DC_CHAT_ID_TRASH],
+            (DC_CHAT_ID_TRASH,),
         )
         .await
         .unwrap());
@@ -425,11 +426,15 @@ async fn test_escaped_recipients() {
         .await
         .unwrap();
 
-    let carl_contact_id =
-        Contact::add_or_lookup(&t, "Carl", "carl@host.tld", Origin::IncomingUnknownFrom)
-            .await
-            .unwrap()
-            .0;
+    let carl_contact_id = Contact::add_or_lookup(
+        &t,
+        "Carl",
+        ContactAddress::new("carl@host.tld").unwrap(),
+        Origin::IncomingUnknownFrom,
+    )
+    .await
+    .unwrap()
+    .0;
 
     receive_imf(
         &t,
@@ -467,11 +472,15 @@ async fn test_cc_to_contact() {
         .await
         .unwrap();
 
-    let carl_contact_id =
-        Contact::add_or_lookup(&t, "garabage", "carl@host.tld", Origin::IncomingUnknownFrom)
-            .await
-            .unwrap()
-            .0;
+    let carl_contact_id = Contact::add_or_lookup(
+        &t,
+        "garabage",
+        ContactAddress::new("carl@host.tld").unwrap(),
+        Origin::IncomingUnknownFrom,
+    )
+    .await
+    .unwrap()
+    .0;
 
     receive_imf(
         &t,
@@ -620,15 +629,14 @@ async fn test_parse_ndn(
         &t,
         format!(
             "Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
-                From: {}\n\
-                To: {}\n\
+                From: {self_addr}\n\
+                To: {foreign_addr}\n\
                 Subject: foo\n\
-                Message-ID: <{}>\n\
+                Message-ID: <{rfc724_mid_outgoing}>\n\
                 Chat-Version: 1.0\n\
                 Date: Sun, 22 Mar 2020 22:37:57 +0000\n\
                 \n\
-                hello\n",
-            self_addr, foreign_addr, rfc724_mid_outgoing
+                hello\n"
         )
         .as_bytes(),
         false,
@@ -641,15 +649,11 @@ async fn test_parse_ndn(
 
     // Check that the ndn would be downloaded:
     let headers = mailparse::parse_mail(raw_ndn).unwrap().headers;
-    assert!(prefetch_should_download(
-        &t,
-        &headers,
-        "some-other-message-id",
-        std::iter::empty(),
-        ShowEmails::Off,
-    )
-    .await
-    .unwrap());
+    assert!(
+        prefetch_should_download(&t, &headers, "some-other-message-id", std::iter::empty(),)
+            .await
+            .unwrap()
+    );
 
     receive_imf(&t, raw_ndn, false).await.unwrap();
     let msg = Message::load_from_db(&t, msg_id).await.unwrap();
@@ -699,7 +703,7 @@ async fn test_parse_ndn_group_msg() -> Result<()> {
 
     assert_eq!(msg.state, MessageState::OutFailed);
 
-    let msgs = chat::get_chat_msgs(&t, msg.chat_id, 0).await?;
+    let msgs = chat::get_chat_msgs(&t, msg.chat_id).await?;
     let msg_id = if let ChatItem::Message { msg_id } = msgs.last().unwrap() {
         msg_id
     } else {
@@ -762,7 +766,6 @@ static GH_MAILINGLIST2: &str =
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_github_mailing_list() -> Result<()> {
     let t = TestContext::new_alice().await;
-    t.ctx.set_config(Config::ShowEmails, Some("2")).await?;
 
     receive_imf(&t.ctx, GH_MAILINGLIST, false).await?;
 
@@ -834,10 +837,6 @@ static DC_MAILINGLIST2: &[u8] = b"Received: (Postfix, from userid 1000); Mon, 4 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_classic_mailing_list() -> Result<()> {
     let t = TestContext::new_alice().await;
-    t.ctx
-        .set_config(Config::ShowEmails, Some("2"))
-        .await
-        .unwrap();
     receive_imf(&t.ctx, DC_MAILINGLIST, false).await.unwrap();
     let chats = Chatlist::try_load(&t.ctx, 0, None, None).await.unwrap();
     let chat_id = chats.get_chat_id(0).unwrap();
@@ -854,7 +853,7 @@ async fn test_classic_mailing_list() -> Result<()> {
     let sent = t.send_text(chat.id, "Hello mailinglist!").await;
     let mime = sent.payload();
 
-    println!("Sent mime message is:\n\n{}\n\n", mime);
+    println!("Sent mime message is:\n\n{mime}\n\n");
     assert!(mime.contains("Content-Type: text/plain; charset=utf-8; format=flowed; delsp=no\r\n"));
     assert!(mime.contains("Subject: =?utf-8?q?Re=3A_=5Bdelta-dev=5D_What=27s_up=3F?=\r\n"));
     assert!(mime.contains("MIME-Version: 1.0\r\n"));
@@ -879,7 +878,6 @@ Hello mailinglist!\r\n"
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_other_device_writes_to_mailinglist() -> Result<()> {
     let t = TestContext::new_alice().await;
-    t.set_config(Config::ShowEmails, Some("2")).await?;
     receive_imf(&t, DC_MAILINGLIST, false).await.unwrap();
     let first_msg = t.get_last_msg().await;
     let first_chat = Chat::load_from_db(&t, first_msg.chat_id).await?;
@@ -929,10 +927,6 @@ async fn test_other_device_writes_to_mailinglist() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_block_mailing_list() {
     let t = TestContext::new_alice().await;
-    t.ctx
-        .set_config(Config::ShowEmails, Some("2"))
-        .await
-        .unwrap();
 
     receive_imf(&t.ctx, DC_MAILINGLIST, false).await.unwrap();
     t.evtracker.wait_next_incoming_message().await;
@@ -960,14 +954,13 @@ async fn test_block_mailing_list() {
     assert_eq!(chats.len(), 0); // Test that the message is not shown
 
     // Both messages are in the same blocked chat.
-    let msgs = chat::get_chat_msgs(&t.ctx, chat_id, 0).await.unwrap();
+    let msgs = chat::get_chat_msgs(&t.ctx, chat_id).await.unwrap();
     assert_eq!(msgs.len(), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_mailing_list_decide_block_then_unblock() {
     let t = TestContext::new_alice().await;
-    t.set_config(Config::ShowEmails, Some("2")).await.unwrap();
 
     receive_imf(&t, DC_MAILINGLIST, false).await.unwrap();
     let blocked = Contact::get_all_blocked(&t).await.unwrap();
@@ -991,17 +984,13 @@ async fn test_mailing_list_decide_block_then_unblock() {
 
     receive_imf(&t.ctx, DC_MAILINGLIST2, false).await.unwrap();
     let msg = t.get_last_msg().await;
-    let msgs = chat::get_chat_msgs(&t, msg.chat_id, 0).await.unwrap();
+    let msgs = chat::get_chat_msgs(&t, msg.chat_id).await.unwrap();
     assert_eq!(msgs.len(), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_mailing_list_decide_not_now() {
     let t = TestContext::new_alice().await;
-    t.ctx
-        .set_config(Config::ShowEmails, Some("2"))
-        .await
-        .unwrap();
 
     receive_imf(&t.ctx, DC_MAILINGLIST, false).await.unwrap();
 
@@ -1013,14 +1002,14 @@ async fn test_mailing_list_decide_not_now() {
 
     let chats = Chatlist::try_load(&t.ctx, 0, None, None).await.unwrap();
     assert_eq!(chats.len(), 1); // Test that chat is still in the chatlist
-    let msgs = chat::get_chat_msgs(&t.ctx, chat_id, 0).await.unwrap();
+    let msgs = chat::get_chat_msgs(&t.ctx, chat_id).await.unwrap();
     assert_eq!(msgs.len(), 1); // ...and contains 1 message
 
     receive_imf(&t.ctx, DC_MAILINGLIST2, false).await.unwrap();
 
     let chats = Chatlist::try_load(&t.ctx, 0, None, None).await.unwrap();
     assert_eq!(chats.len(), 1); // Test that the new mailing list message got into the same chat
-    let msgs = chat::get_chat_msgs(&t.ctx, chat_id, 0).await.unwrap();
+    let msgs = chat::get_chat_msgs(&t.ctx, chat_id).await.unwrap();
     assert_eq!(msgs.len(), 2);
     let chat = Chat::load_from_db(&t.ctx, chat_id).await.unwrap();
     assert!(chat.is_contact_request());
@@ -1029,10 +1018,6 @@ async fn test_mailing_list_decide_not_now() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_mailing_list_decide_accept() {
     let t = TestContext::new_alice().await;
-    t.ctx
-        .set_config(Config::ShowEmails, Some("2"))
-        .await
-        .unwrap();
 
     receive_imf(&t.ctx, DC_MAILINGLIST, false).await.unwrap();
 
@@ -1046,7 +1031,7 @@ async fn test_mailing_list_decide_accept() {
 
     receive_imf(&t.ctx, DC_MAILINGLIST2, false).await.unwrap();
 
-    let msgs = chat::get_chat_msgs(&t.ctx, chat_id, 0).await.unwrap();
+    let msgs = chat::get_chat_msgs(&t.ctx, chat_id).await.unwrap();
     assert_eq!(msgs.len(), 2);
     let chat = chat::Chat::load_from_db(&t.ctx, chat_id).await.unwrap();
     assert!(chat.can_send(&t.ctx).await.unwrap());
@@ -1055,7 +1040,6 @@ async fn test_mailing_list_decide_accept() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_mailing_list_multiple_names_in_subject() -> Result<()> {
     let t = TestContext::new_alice().await;
-    t.set_config(Config::ShowEmails, Some("2")).await?;
     receive_imf(
         &t,
         b"From: Foo Bar <foo@bar.org>\n\
@@ -1080,7 +1064,6 @@ async fn test_mailing_list_multiple_names_in_subject() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_majordomo_mailing_list() -> Result<()> {
     let t = TestContext::new_alice().await;
-    t.set_config(Config::ShowEmails, Some("2")).await.unwrap();
 
     // test mailing lists not having a `ListId:`-header
     receive_imf(
@@ -1104,7 +1087,7 @@ async fn test_majordomo_mailing_list() -> Result<()> {
     assert_eq!(chat.typ, Chattype::Mailinglist);
     assert_eq!(chat.grpid, "mylist@bar.org");
     assert_eq!(chat.name, "ola");
-    assert_eq!(chat::get_chat_msgs(&t, chat.id, 0).await.unwrap().len(), 1);
+    assert_eq!(chat::get_chat_msgs(&t, chat.id).await.unwrap().len(), 1);
     assert!(!chat.can_send(&t).await?);
     assert_eq!(chat.get_mailinglist_addr(), None);
 
@@ -1125,7 +1108,7 @@ async fn test_majordomo_mailing_list() -> Result<()> {
     )
     .await
     .unwrap();
-    assert_eq!(chat::get_chat_msgs(&t, chat.id, 0).await.unwrap().len(), 2);
+    assert_eq!(chat::get_chat_msgs(&t, chat.id).await.unwrap().len(), 2);
 
     Ok(())
 }
@@ -1133,7 +1116,6 @@ async fn test_majordomo_mailing_list() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_mailchimp_mailing_list() -> Result<()> {
     let t = TestContext::new_alice().await;
-    t.set_config(Config::ShowEmails, Some("2")).await.unwrap();
 
     receive_imf(
             &t,
@@ -1167,7 +1149,6 @@ async fn test_mailchimp_mailing_list() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_dhl_mailing_list() -> Result<()> {
     let t = TestContext::new_alice().await;
-    t.set_config(Config::ShowEmails, Some("2")).await.unwrap();
 
     receive_imf(
         &t,
@@ -1196,7 +1177,6 @@ async fn test_dhl_mailing_list() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_dpd_mailing_list() -> Result<()> {
     let t = TestContext::new_alice().await;
-    t.set_config(Config::ShowEmails, Some("2")).await.unwrap();
 
     receive_imf(
         &t,
@@ -1225,7 +1205,6 @@ async fn test_dpd_mailing_list() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_xt_local_mailing_list() -> Result<()> {
     let t = TestContext::new_alice().await;
-    t.set_config(Config::ShowEmails, Some("2")).await?;
 
     receive_imf(
         &t,
@@ -1259,7 +1238,6 @@ async fn test_xt_local_mailing_list() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_xing_mailing_list() -> Result<()> {
     let t = TestContext::new_alice().await;
-    t.set_config(Config::ShowEmails, Some("2")).await?;
 
     receive_imf(
         &t,
@@ -1282,7 +1260,6 @@ async fn test_xing_mailing_list() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_ttline_mailing_list() -> Result<()> {
     let t = TestContext::new_alice().await;
-    t.set_config(Config::ShowEmails, Some("2")).await?;
 
     receive_imf(
         &t,
@@ -1303,7 +1280,6 @@ async fn test_ttline_mailing_list() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_mailing_list_with_mimepart_footer() {
     let t = TestContext::new_alice().await;
-    t.set_config(Config::ShowEmails, Some("2")).await.unwrap();
 
     // the mailing list message contains two top-level texts.
     // the second text is a footer that is added by some mailing list software
@@ -1324,7 +1300,7 @@ async fn test_mailing_list_with_mimepart_footer() {
     );
     assert!(msg.has_html());
     let chat = Chat::load_from_db(&t, msg.chat_id).await.unwrap();
-    assert_eq!(get_chat_msgs(&t, msg.chat_id, 0).await.unwrap().len(), 1);
+    assert_eq!(get_chat_msgs(&t, msg.chat_id).await.unwrap().len(), 1);
     assert_eq!(chat.typ, Chattype::Mailinglist);
     assert_eq!(chat.blocked, Blocked::Request);
     assert_eq!(chat.grpid, "intern.lists.abc.de");
@@ -1334,7 +1310,6 @@ async fn test_mailing_list_with_mimepart_footer() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_mailing_list_with_mimepart_footer_signed() {
     let t = TestContext::new_alice().await;
-    t.set_config(Config::ShowEmails, Some("2")).await.unwrap();
 
     receive_imf(
         &t,
@@ -1344,7 +1319,7 @@ async fn test_mailing_list_with_mimepart_footer_signed() {
     .await
     .unwrap();
     let msg = t.get_last_msg().await;
-    assert_eq!(get_chat_msgs(&t, msg.chat_id, 0).await.unwrap().len(), 1);
+    assert_eq!(get_chat_msgs(&t, msg.chat_id).await.unwrap().len(), 1);
     let text = msg.text.clone().unwrap();
     assert!(text.contains("content text"));
     assert!(!text.contains("footer text"));
@@ -1359,7 +1334,6 @@ async fn test_mailing_list_with_mimepart_footer_signed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_apply_mailinglist_changes_assigned_by_reply() {
     let t = TestContext::new_alice().await;
-    t.set_config(Config::ShowEmails, Some("2")).await.unwrap();
 
     receive_imf(&t, GH_MAILINGLIST, false).await.unwrap();
 
@@ -1368,7 +1342,7 @@ async fn test_apply_mailinglist_changes_assigned_by_reply() {
     let chat = Chat::load_from_db(&t, chat_id).await.unwrap();
     assert!(chat.can_send(&t).await.unwrap());
 
-    let imf_raw = format!("In-Reply-To: 3333@example.org\n{}", GH_MAILINGLIST2);
+    let imf_raw = format!("In-Reply-To: 3333@example.org\n{GH_MAILINGLIST2}");
     receive_imf(&t, imf_raw.as_bytes(), false).await.unwrap();
 
     assert_eq!(
@@ -1455,15 +1429,11 @@ async fn test_dont_show_noreply_in_contacts_list() {
 
 async fn check_dont_show_in_contacts_list(addr: &str) {
     let t = TestContext::new_alice().await;
-    t.ctx
-        .set_config(Config::ShowEmails, Some("2"))
-        .await
-        .unwrap();
     receive_imf(
         &t,
         format!(
             "Subject: Re: [deltachat/deltachat-core-rust] DC is the best repo on GitHub!
-To: {}
+To: {addr}
 References: <deltachat/deltachat-core-rust/pull/1625@github.com>
  <deltachat/deltachat-core-rust/pull/1625/c644661857@github.com>
 From: alice@example.org
@@ -1474,8 +1444,7 @@ Content-Type: text/plain; charset=utf-8
 Content-Transfer-Encoding: 7bit
 
 YEAAAAAA!.
-",
-            addr
+"
         )
         .as_bytes(),
         false,
@@ -1529,7 +1498,6 @@ async fn test_pdf_filename_continuation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_many_images() {
     let t = TestContext::new_alice().await;
-    t.set_config(Config::ShowEmails, Some("2")).await.unwrap();
 
     receive_imf(
         &t,
@@ -1542,7 +1510,7 @@ async fn test_many_images() {
     assert_eq!(msg.viewtype, Viewtype::Image);
     assert!(msg.has_html());
     let chat = Chat::load_from_db(&t, msg.chat_id).await.unwrap();
-    assert_eq!(get_chat_msgs(&t, chat.id, 0).await.unwrap().len(), 1);
+    assert_eq!(get_chat_msgs(&t, chat.id).await.unwrap().len(), 1);
 }
 
 /// Test that classical MUA messages are assigned to group chats based on the `In-Reply-To`
@@ -1592,7 +1560,7 @@ async fn test_in_reply_to() {
     assert_eq!(msg.get_text().unwrap(), "reply foo");
 
     // Load the first message from the same chat.
-    let msgs = chat::get_chat_msgs(&t, msg.chat_id, 0).await.unwrap();
+    let msgs = chat::get_chat_msgs(&t, msg.chat_id).await.unwrap();
     let msg_id = if let ChatItem::Message { msg_id } = msgs.first().unwrap() {
         msg_id
     } else {
@@ -1806,10 +1774,6 @@ async fn create_test_alias(chat_request: bool, group_request: bool) -> (TestCont
     };
 
     let alice = TestContext::new_alice().await;
-    alice
-        .set_config(Config::ShowEmails, Some("2"))
-        .await
-        .unwrap();
     receive_imf(&alice, claire_request.as_bytes(), false)
         .await
         .unwrap();
@@ -1819,7 +1783,7 @@ async fn create_test_alias(chat_request: bool, group_request: bool) -> (TestCont
     assert!(msg.get_text().unwrap().contains("hi support!"));
     let chat = Chat::load_from_db(&alice, msg.chat_id).await.unwrap();
     assert_eq!(chat.typ, Chattype::Group);
-    assert_eq!(get_chat_msgs(&alice, chat.id, 0).await.unwrap().len(), 1);
+    assert_eq!(get_chat_msgs(&alice, chat.id).await.unwrap().len(), 1);
     if group_request {
         assert_eq!(get_chat_contacts(&alice, chat.id).await.unwrap().len(), 4);
     } else {
@@ -1829,10 +1793,6 @@ async fn create_test_alias(chat_request: bool, group_request: bool) -> (TestCont
 
     let claire = TestContext::new().await;
     claire.configure_addr("claire@example.org").await;
-    claire
-        .set_config(Config::ShowEmails, Some("2"))
-        .await
-        .unwrap();
     receive_imf(&claire, claire_request.as_bytes(), false)
         .await
         .unwrap();
@@ -1852,7 +1812,7 @@ async fn create_test_alias(chat_request: bool, group_request: bool) -> (TestCont
     } else {
         assert_eq!(chat.typ, Chattype::Single);
     }
-    assert_eq!(get_chat_msgs(&claire, chat.id, 0).await.unwrap().len(), 1);
+    assert_eq!(get_chat_msgs(&claire, chat.id).await.unwrap().len(), 1);
     assert_eq!(msg.get_override_sender_name(), None);
 
     (claire, alice)
@@ -1944,7 +1904,6 @@ async fn test_alias_answer_from_dc() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_dont_assign_to_trash_by_parent() {
     let t = TestContext::new_alice().await;
-    t.set_config(Config::ShowEmails, Some("2")).await.unwrap();
     println!("\n========= Receive a message ==========");
     receive_imf(
         &t,
@@ -1967,7 +1926,7 @@ async fn test_dont_assign_to_trash_by_parent() {
     println!("\n========= Delete the message ==========");
     msg.id.trash(&t).await.unwrap();
 
-    let msgs = chat::get_chat_msgs(&t.ctx, chat_id, 0).await.unwrap();
+    let msgs = chat::get_chat_msgs(&t.ctx, chat_id).await.unwrap();
     assert_eq!(msgs.len(), 0);
 
     println!("\n========= Receive a message that is a reply to the deleted message ==========");
@@ -2020,12 +1979,6 @@ Message content",
 async fn test_outgoing_classic_mail_creates_chat() {
     let alice = TestContext::new_alice().await;
 
-    // Alice enables classic emails.
-    alice
-        .set_config(Config::ShowEmails, Some("2"))
-        .await
-        .unwrap();
-
     // Alice downloads outgoing classic email.
     receive_imf(
         &alice,
@@ -2054,7 +2007,7 @@ async fn test_duplicate_message() -> Result<()> {
     let bob_contact_id = Contact::add_or_lookup(
         &alice,
         "Bob",
-        "bob@example.org",
+        ContactAddress::new("bob@example.org").unwrap(),
         Origin::IncomingUnknownFrom,
     )
     .await?
@@ -2108,10 +2061,14 @@ Second signature";
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_ignore_footer_status_from_mailinglist() -> Result<()> {
     let t = TestContext::new_alice().await;
-    t.set_config(Config::ShowEmails, Some("2")).await?;
-    let bob_id = Contact::add_or_lookup(&t, "", "bob@example.net", Origin::IncomingUnknownCc)
-        .await?
-        .0;
+    let bob_id = Contact::add_or_lookup(
+        &t,
+        "",
+        ContactAddress::new("bob@example.net").unwrap(),
+        Origin::IncomingUnknownCc,
+    )
+    .await?
+    .0;
     let bob = Contact::load_from_db(&t, bob_id).await?;
     assert_eq!(bob.get_status(), "");
     assert_eq!(Chatlist::try_load(&t, 0, None, None).await?.len(), 0);
@@ -2130,9 +2087,11 @@ Original signature",
         false,
     )
     .await?;
-    let one2one_chat_id = t.get_last_msg().await.chat_id;
+    let msg = t.get_last_msg().await;
+    let one2one_chat_id = msg.chat_id;
     let bob = Contact::load_from_db(&t, bob_id).await?;
     assert_eq!(bob.get_status(), "Original signature");
+    assert!(!msg.has_html());
 
     receive_imf(
         &t,
@@ -2172,9 +2131,79 @@ Original signature updated",
     .await?;
     let bob = Contact::load_from_db(&t, bob_id).await?;
     assert_eq!(bob.get_status(), "Original signature updated");
-    assert_eq!(get_chat_msgs(&t, one2one_chat_id, 0).await?.len(), 2);
-    assert_eq!(get_chat_msgs(&t, ml_chat_id, 0).await?.len(), 1);
+    assert_eq!(get_chat_msgs(&t, one2one_chat_id).await?.len(), 2);
+    assert_eq!(get_chat_msgs(&t, ml_chat_id).await?.len(), 1);
     assert_eq!(Chatlist::try_load(&t, 0, None, None).await?.len(), 2);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ignore_old_status_updates() -> Result<()> {
+    let t = TestContext::new_alice().await;
+    let bob_id = Contact::add_or_lookup(
+        &t,
+        "",
+        ContactAddress::new("bob@example.net")?,
+        Origin::AddressBook,
+    )
+    .await?
+    .0;
+
+    receive_imf(
+        &t,
+        b"From: Bob <bob@example.net>
+To: Alice <alice@example.org>
+Message-ID: <2@example.org>
+Date: Wed, 22 Feb 2023 20:00:00 +0000
+
+body
+
+--
+sig wednesday",
+        false,
+    )
+    .await?;
+    let chat_id = t.get_last_msg().await.chat_id;
+    let bob = Contact::load_from_db(&t, bob_id).await?;
+    assert_eq!(bob.get_status(), "sig wednesday");
+    assert_eq!(get_chat_msgs(&t, chat_id).await?.len(), 1);
+
+    receive_imf(
+        &t,
+        b"From: Bob <bob@example.net>
+To: Alice <alice@example.org>
+Message-ID: <1@example.org>
+Date: Tue, 21 Feb 2023 20:00:00 +0000
+
+body
+
+--
+sig tuesday",
+        false,
+    )
+    .await?;
+    let bob = Contact::load_from_db(&t, bob_id).await?;
+    assert_eq!(bob.get_status(), "sig wednesday");
+    assert_eq!(get_chat_msgs(&t, chat_id).await?.len(), 2);
+
+    receive_imf(
+        &t,
+        b"From: Bob <bob@example.net>
+To: Alice <alice@example.org>
+Message-ID: <3@example.org>
+Date: Thu, 23 Feb 2023 20:00:00 +0000
+
+body
+
+--
+sig thursday",
+        false,
+    )
+    .await?;
+    let bob = Contact::load_from_db(&t, bob_id).await?;
+    assert_eq!(bob.get_status(), "sig thursday");
+    assert_eq!(get_chat_msgs(&t, chat_id).await?.len(), 3);
+
     Ok(())
 }
 
@@ -2182,7 +2211,6 @@ Original signature updated",
 async fn test_chat_assignment_private_classical_reply() {
     for outgoing_is_classical in &[true, false] {
         let t = TestContext::new_alice().await;
-        t.set_config(Config::ShowEmails, Some("2")).await.unwrap();
 
         receive_imf(
             &t,
@@ -2268,7 +2296,6 @@ async fn test_chat_assignment_private_chat_reply() {
         &[(true, true), (false, true), (false, false)]
     {
         let t = TestContext::new_alice().await;
-        t.set_config(Config::ShowEmails, Some("2")).await.unwrap();
 
         receive_imf(
             &t,
@@ -2362,7 +2389,6 @@ Sent with my Delta Chat Messenger: https://delta.chat
 async fn test_chat_assignment_nonprivate_classical_reply() {
     for outgoing_is_classical in &[true, false] {
         let t = TestContext::new_alice().await;
-        t.set_config(Config::ShowEmails, Some("2")).await.unwrap();
 
         receive_imf(
             &t,
@@ -2463,7 +2489,7 @@ Reply to all"#,
 
 /// Tests that replies to similar ad hoc groups are correctly assigned to chats.
 ///
-/// The difficutly here is that ad hoc groups don't have unique group IDs, because both
+/// The difficulty here is that ad hoc groups don't have unique group IDs, because both
 /// messages have the same recipient lists and only differ in the subject and message contents.
 /// The messages can be properly assigned to chats only using the In-Reply-To or References
 /// headers.
@@ -2471,8 +2497,6 @@ Reply to all"#,
 async fn test_chat_assignment_adhoc() -> Result<()> {
     let alice = TestContext::new_alice().await;
     let bob = TestContext::new_bob().await;
-    alice.set_config(Config::ShowEmails, Some("2")).await?;
-    bob.set_config(Config::ShowEmails, Some("2")).await?;
 
     let first_thread_mime = br#"Subject: First thread
 Message-ID: first@example.org
@@ -2523,13 +2547,8 @@ Second thread."#;
 
     // Alice adds Fiona to both ad hoc groups.
     let fiona = TestContext::new_fiona().await;
-    let (alice_fiona_contact_id, _) = Contact::add_or_lookup(
-        &alice,
-        "Fiona",
-        "fiona@example.net",
-        Origin::IncomingUnknownTo,
-    )
-    .await?;
+    let alice_fiona_contact = alice.add_or_lookup_contact(&fiona).await;
+    let alice_fiona_contact_id = alice_fiona_contact.id;
 
     chat::add_contact_to_chat(&alice, alice_first_msg.chat_id, alice_fiona_contact_id).await?;
     let alice_first_invite = alice.pop_sent_msg().await;
@@ -2583,7 +2602,6 @@ async fn test_read_receipts_dont_create_chats() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_gmx_forwarded_msg() -> Result<()> {
     let t = TestContext::new_alice().await;
-    t.set_config(Config::ShowEmails, Some("2")).await?;
 
     receive_imf(
         &t,
@@ -2628,7 +2646,6 @@ async fn test_incoming_contact_request() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_get_parent_message() -> Result<()> {
     let t = TestContext::new_alice().await;
-    t.set_config(Config::ShowEmails, Some("2")).await?;
 
     let mime = br#"Subject: First
 Message-ID: first@example.net
@@ -2667,7 +2684,7 @@ References: <second@example.net> <nonexistent@example.net> <first@example.net>
 Content-Type: text/plain; charset=utf-8; format=flowed; delsp=no
 
 Message with references."#;
-    let mime_parser = MimeMessage::from_bytes(&t, &mime[..]).await?;
+    let mime_parser = MimeMessage::from_bytes(&t, &mime[..], None).await?;
 
     let parent = get_parent_message(&t, &mime_parser).await?.unwrap();
     assert_eq!(parent.id, first.id);
@@ -2702,8 +2719,6 @@ async fn test_rfc1847_encapsulation() -> Result<()> {
     bob.recv_msg(&first_msg).await;
     message::delete_msgs(&bob, &[bob.get_last_msg().await.id]).await?;
 
-    bob.set_config(Config::ShowEmails, Some("2")).await?;
-
     // Alice sends a message to Bob using Thunderbird.
     let raw = include_bytes!("../../test-data/message/rfc1847_encapsulation.eml");
     receive_imf(&bob, raw, false).await?;
@@ -2729,7 +2744,6 @@ async fn test_invalid_to_address() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_reply_from_different_addr() -> Result<()> {
     let t = TestContext::new_alice().await;
-    t.set_config(Config::ShowEmails, Some("2")).await?;
 
     // Alice creates a 2-person-group with Bob
     receive_imf(
@@ -2807,7 +2821,7 @@ async fn test_long_filenames() -> Result<()> {
         "a.a..a.a.a.a.tar.gz",
     ] {
         let attachment = alice.blobdir.join(filename_sent);
-        let content = format!("File content of {}", filename_sent);
+        let content = format!("File content of {filename_sent}");
         tokio::fs::write(&attachment, content.as_bytes()).await?;
 
         let mut msg_alice = Message::new(Viewtype::File);
@@ -2824,14 +2838,11 @@ async fn test_long_filenames() -> Result<()> {
             let path = msg.get_file(t).unwrap();
             assert!(
                 resulting_filename.ends_with(".tar.gz"),
-                "{:?} doesn't end with .tar.gz, path: {:?}",
-                resulting_filename,
-                path
+                "{resulting_filename:?} doesn't end with .tar.gz, path: {path:?}"
             );
             assert!(
                 path.to_str().unwrap().ends_with(".tar.gz"),
-                "path {:?} doesn't end with .tar.gz",
-                path
+                "path {path:?} doesn't end with .tar.gz"
             );
             assert_eq!(fs::read_to_string(path).await.unwrap(), content);
         }
@@ -2973,6 +2984,17 @@ async fn test_auto_accept_for_bots() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_auto_accept_group_for_bots() -> Result<()> {
+    let t = TestContext::new_alice().await;
+    t.set_config(Config::Bot, Some("1")).await.unwrap();
+    receive_imf(&t, GRP_MAIL, false).await?;
+    let msg = t.get_last_msg().await;
+    let chat = chat::Chat::load_from_db(&t, msg.chat_id).await?;
+    assert!(!chat.is_contact_request());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_no_private_reply_to_blocked_account() -> Result<()> {
     let mut tcm = TestContextManager::new();
     let alice = tcm.alice().await;
@@ -3037,10 +3059,57 @@ async fn test_no_private_reply_to_blocked_account() -> Result<()> {
     Ok(())
 }
 
+/// Regression test for two bugs:
+///
+/// 1. If you blocked some spammer using DC, the 1:1 messages with that contact
+///    are not received, but they could easily bypass this restriction creating
+///    a new group with only you two as member.
+/// 2. A blocked group was sometimes not unblocked when when an unblocked
+///    contact sent a message into it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_blocked_contact_creates_group() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = tcm.alice().await;
+    let bob = tcm.bob().await;
+    let fiona = tcm.fiona().await;
+
+    let chat = alice.create_chat(&bob).await;
+    chat.id.block(&alice).await?;
+
+    let group_id = bob
+        .create_group_with_members(
+            ProtectionStatus::Unprotected,
+            "group name",
+            &[&alice, &fiona],
+        )
+        .await;
+
+    let sent = bob.send_text(group_id, "Heyho, I'm a spammer!").await;
+    let rcvd = alice.recv_msg(&sent).await;
+    // Alice blocked Bob, so she shouldn't get the message
+    assert_eq!(rcvd.chat_blocked, Blocked::Yes);
+
+    // Fiona didn't block Bob, though, so she gets the message
+    let rcvd = fiona.recv_msg(&sent).await;
+    assert_eq!(rcvd.chat_blocked, Blocked::Request);
+
+    // Fiona writes to the group
+    rcvd.chat_id.accept(&fiona).await?;
+    let sent = fiona.send_text(rcvd.chat_id, "Hello from Fiona").await;
+
+    // The group is unblocked now that Fiona sent a message to it
+    let rcvd = alice.recv_msg(&sent).await;
+    assert_eq!(rcvd.chat_blocked, Blocked::Request);
+    // In order not to lose context, Bob's message should also be shown in the group
+    let msgs = chat::get_chat_msgs(&alice, rcvd.chat_id).await?;
+    assert_eq!(msgs.len(), 2);
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_thunderbird_autocrypt() -> Result<()> {
     let t = TestContext::new_bob().await;
-    t.set_config(Config::ShowEmails, Some("2")).await?;
 
     let raw = include_bytes!("../../test-data/message/thunderbird_with_autocrypt.eml");
     receive_imf(&t, raw, false).await?;
@@ -3056,7 +3125,6 @@ async fn test_thunderbird_autocrypt() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_thunderbird_autocrypt_unencrypted() -> Result<()> {
     let t = TestContext::new_bob().await;
-    t.set_config(Config::ShowEmails, Some("2")).await?;
 
     let raw = include_bytes!("../../test-data/message/thunderbird_with_autocrypt_unencrypted.eml");
     receive_imf(&t, raw, false).await?;
@@ -3082,7 +3150,6 @@ async fn test_thunderbird_autocrypt_unencrypted() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_thunderbird_unsigned() -> Result<()> {
     let alice = TestContext::new_alice().await;
-    alice.set_config(Config::ShowEmails, Some("2")).await?;
 
     // Alice receives an unsigned message from Bob.
     let raw = include_bytes!("../../test-data/message/thunderbird_encrypted_unsigned.eml");
@@ -3236,5 +3303,270 @@ async fn test_mua_user_adds_recipient_to_single_chat() -> Result<()> {
         .unwrap();
     assert!(chat::is_contact_in_chat(&alice, group_chat.id, fiona).await?);
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_sync_member_list_on_rejoin() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = tcm.alice().await;
+
+    let bob_id = Contact::create(&alice, "", "bob@example.net").await?;
+    let claire_id = Contact::create(&alice, "", "claire@example.de").await?;
+
+    let alice_chat_id = create_group_chat(&alice, ProtectionStatus::Unprotected, "foos").await?;
+    add_contact_to_chat(&alice, alice_chat_id, bob_id).await?;
+    add_contact_to_chat(&alice, alice_chat_id, claire_id).await?;
+
+    send_text_msg(&alice, alice_chat_id, "populate".to_string()).await?;
+    let add = alice.pop_sent_msg().await;
+    let bob = tcm.bob().await;
+    bob.recv_msg(&add).await;
+    let bob_chat_id = bob.get_last_msg().await.chat_id;
+    assert_eq!(get_chat_contacts(&bob, bob_chat_id).await?.len(), 3);
+
+    // remove bob from chat
+    remove_contact_from_chat(&alice, alice_chat_id, bob_id).await?;
+    let remove_bob = alice.pop_sent_msg().await;
+    bob.recv_msg(&remove_bob).await;
+
+    // remove any other member
+    remove_contact_from_chat(&alice, alice_chat_id, claire_id).await?;
+    alice.pop_sent_msg().await;
+
+    // readd bob
+    add_contact_to_chat(&alice, alice_chat_id, bob_id).await?;
+    let add2 = alice.pop_sent_msg().await;
+    bob.recv_msg(&add2).await;
+
+    // number of members in chat should have updated
+    assert_eq!(get_chat_contacts(&bob, bob_chat_id).await?.len(), 2);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_dont_recreate_contacts_on_add_remove() -> Result<()> {
+    let alice = TestContext::new_alice().await;
+    let bob = TestContext::new_bob().await;
+
+    let alice_chat_id = create_group_chat(&alice, ProtectionStatus::Unprotected, "Group").await?;
+
+    add_contact_to_chat(
+        &alice,
+        alice_chat_id,
+        Contact::create(&alice, "bob", "bob@example.net").await?,
+    )
+    .await?;
+
+    send_text_msg(&alice, alice_chat_id, "populate".to_string()).await?;
+    let bob_chat_id = bob.recv_msg(&alice.pop_sent_msg().await).await.chat_id;
+    bob_chat_id.accept(&bob).await?;
+
+    // alice adds a member
+    add_contact_to_chat(
+        &alice,
+        alice_chat_id,
+        Contact::create(&alice, "fiona", "fiona@example.net").await?,
+    )
+    .await?;
+
+    // bob adds a member.
+    let bob_blue = Contact::create(&bob, "blue", "blue@example.net").await?;
+    add_contact_to_chat(&bob, bob_chat_id, bob_blue).await?;
+
+    alice.recv_msg(&bob.pop_sent_msg().await).await;
+
+    // bob didn't receive the addition of fiona, but alice doesn't overwrite her own
+    // contact list with the one from bob which only has three members instead of four.
+    assert_eq!(get_chat_contacts(&alice, alice_chat_id).await?.len(), 4);
+
+    // bob removes a member.
+    remove_contact_from_chat(&bob, bob_chat_id, bob_blue).await?;
+
+    alice.recv_msg(&bob.pop_sent_msg().await).await;
+
+    // Bobs chat only has two members after the removal of blue, because he still
+    // didn't receive the addition of fiona. But that doesn't overwrite alice'
+    // memberlist.
+    assert_eq!(get_chat_contacts(&alice, alice_chat_id).await?.len(), 3);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_recreate_contact_list_on_missing_message() -> Result<()> {
+    let alice = TestContext::new_alice().await;
+    let bob = TestContext::new_bob().await;
+    let chat_id = create_group_chat(&alice, ProtectionStatus::Unprotected, "Group").await?;
+    let alice_fiona = Contact::create(&alice, "fiona", "fiona@example.net").await?;
+    // create chat with three members
+    add_to_chat_contacts_table(
+        &alice,
+        chat_id,
+        &[
+            Contact::create(&alice, "bob", "bob@example.net").await?,
+            alice_fiona,
+        ],
+    )
+    .await?;
+
+    send_text_msg(&alice, chat_id, "populate".to_string()).await?;
+    let bob_chat_id = bob.recv_msg(&alice.pop_sent_msg().await).await.chat_id;
+    bob_chat_id.accept(&bob).await?;
+
+    // bob removes a member
+    let bob_contact_fiona = Contact::create(&bob, "fiona", "fiona@example.net").await?;
+    remove_contact_from_chat(&bob, bob_chat_id, bob_contact_fiona).await?;
+    let remove_msg = bob.pop_sent_msg().await;
+
+    // bob adds a new member
+    let bob_blue = Contact::create(&bob, "blue", "blue@example.net").await?;
+    add_contact_to_chat(&bob, bob_chat_id, bob_blue).await?;
+
+    let add_msg = bob.pop_sent_msg().await;
+
+    // alice only receives the addition of the member
+    alice.recv_msg(&add_msg).await;
+
+    // since we missed a message, a new contact list should be build
+    assert_eq!(get_chat_contacts(&alice, chat_id).await?.len(), 3);
+
+    // readd fiona
+    add_contact_to_chat(&alice, chat_id, alice_fiona).await?;
+
+    alice.recv_msg(&remove_msg).await;
+
+    // delayed removal of fiona shouldn't remove her
+    assert_eq!(get_chat_contacts(&alice, chat_id).await?.len(), 4);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_dont_readd_with_normal_msg() -> Result<()> {
+    let alice = TestContext::new_alice().await;
+    let bob = TestContext::new_bob().await;
+
+    let alice_chat_id = create_group_chat(&alice, ProtectionStatus::Unprotected, "Group").await?;
+
+    add_contact_to_chat(
+        &alice,
+        alice_chat_id,
+        Contact::create(&alice, "bob", "bob@example.net").await?,
+    )
+    .await?;
+
+    send_text_msg(&alice, alice_chat_id, "populate".to_string()).await?;
+    let bob_chat_id = bob.recv_msg(&alice.pop_sent_msg().await).await.chat_id;
+    bob_chat_id.accept(&bob).await?;
+
+    remove_contact_from_chat(&bob, bob_chat_id, ContactId::SELF).await?;
+    assert_eq!(get_chat_contacts(&bob, bob_chat_id).await?.len(), 1);
+
+    add_contact_to_chat(
+        &alice,
+        alice_chat_id,
+        Contact::create(&alice, "fiora", "fiora@example.net").await?,
+    )
+    .await?;
+
+    bob.recv_msg(&alice.pop_sent_msg().await).await;
+
+    // Alice didn't receive Bobs leave message, but bob shouldn't readded himself just because of that.
+    assert!(!is_contact_in_chat(&bob, bob_chat_id, ContactId::SELF).await?);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_mua_cant_remove() -> Result<()> {
+    let alice = TestContext::new_alice().await;
+
+    // Alice creates chat with 3 contacts
+    let msg = receive_imf(
+        &alice,
+        b"Subject: =?utf-8?q?Message_from_alice=40example=2Eorg?=\r\n\
+            From: alice@example.org\r\n\
+            To: <bob@example.net>, <claire@example.org>, <fiona@example.org> \r\n\
+            Date: Mon, 12 Dec 2022 14:30:39 +0000\r\n\
+            Message-ID: <Mr.alices_original_mail@example.org>\r\n\
+            Chat-Version: 1.0\r\n\
+            \r\n\
+            tst\r\n",
+        false,
+    )
+    .await?
+    .unwrap();
+    let alice_chat = Chat::load_from_db(&alice, msg.chat_id).await?;
+    assert_eq!(alice_chat.typ, Chattype::Group);
+
+    // Bob uses a classical MUA to answer, removing a recipient.
+    let bob_removes = receive_imf(
+        &alice,
+        b"Subject: Re: Message from alice\r\n\
+            From: <bob@example.net>\r\n\
+            To: <alice@example.org>, <claire@example.org>\r\n\
+            Date: Mon, 12 Dec 2022 14:32:39 +0000\r\n\
+            Message-ID: <bobs_answer_to_two_recipients@example.net>\r\n\
+            In-Reply-To: <Mr.alices_original_mail@example.org>\r\n\
+            \r\n\
+            Hi back!\r\n",
+        false,
+    )
+    .await?
+    .unwrap();
+    assert_eq!(bob_removes.chat_id, alice_chat.id);
+    let group_chat = Chat::load_from_db(&alice, bob_removes.chat_id).await?;
+    assert_eq!(group_chat.typ, Chattype::Group);
+    assert_eq!(
+        chat::get_chat_contacts(&alice, group_chat.id).await?.len(),
+        4
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_mua_can_add() -> Result<()> {
+    let alice = TestContext::new_alice().await;
+
+    // Alice creates chat with 3 contacts
+    let msg = receive_imf(
+        &alice,
+        b"Subject: =?utf-8?q?Message_from_alice=40example=2Eorg?=\r\n\
+            From: alice@example.org\r\n\
+            To: <bob@example.net>, <claire@example.org>, <fiona@example.org> \r\n\
+            Date: Mon, 12 Dec 2022 14:30:39 +0000\r\n\
+            Message-ID: <Mr.alices_original_mail@example.org>\r\n\
+            Chat-Version: 1.0\r\n\
+            \r\n\
+            Hi!\r\n",
+        false,
+    )
+    .await?
+    .unwrap();
+    let alice_chat = Chat::load_from_db(&alice, msg.chat_id).await?;
+    assert_eq!(alice_chat.typ, Chattype::Group);
+
+    // Bob uses a classical MUA to answer, adding a recipient.
+    let bob_adds = receive_imf(
+        &alice,
+        b"Subject: Re: Message from alice\r\n\
+            From: <bob@example.net>\r\n\
+            To: <alice@example.org>, <claire@example.org>, <fiona@example.org>, <greg@example.host>\r\n\
+            Date: Mon, 12 Dec 2022 14:32:39 +0000\r\n\
+            Message-ID: <bobs_answer_to_two_recipients@example.net>\r\n\
+            In-Reply-To: <Mr.alices_original_mail@example.org>\r\n\
+            \r\n\
+            Hi back!\r\n",
+        false,
+    )
+    .await?
+    .unwrap();
+
+    let group_chat = Chat::load_from_db(&alice, bob_adds.chat_id).await?;
+    assert_eq!(group_chat.typ, Chattype::Group);
+    assert_eq!(
+        chat::get_chat_contacts(&alice, group_chat.id).await?.len(),
+        5
+    );
     Ok(())
 }

@@ -1,14 +1,25 @@
-//! Email accounts autoconfiguration process module.
+//! # Email accounts autoconfiguration process.
+//!
+//! The module provides automatic lookup of configuration
+//! for email providers based on the built-in [provider database],
+//! [Mozilla Thunderbird Autoconfiguration protocol]
+//! and [Outlook's Autodiscover].
+//!
+//! [provider database]: crate::provider
+//! [Mozilla Thunderbird Autoconfiguration protocol]: auto_mozilla
+//! [Outlook's Autodiscover]: auto_outlook
 
 mod auto_mozilla;
 mod auto_outlook;
-mod read_url;
 mod server_params;
 
 use anyhow::{bail, ensure, Context as _, Result};
+use auto_mozilla::moz_autoconfigure;
+use auto_outlook::outlk_autodiscover;
 use futures::FutureExt;
 use futures_lite::FutureExt as _;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+use server_params::{expand_param_vector, ServerParams};
 use tokio::task;
 
 use crate::config::Config;
@@ -27,10 +38,6 @@ use crate::socks::Socks5Config;
 use crate::stock_str;
 use crate::tools::{time, EmailAddress};
 use crate::{chat, e2ee, provider};
-
-use auto_mozilla::moz_autoconfigure;
-use auto_outlook::outlk_autodiscover;
-use server_params::{expand_param_vector, ServerParams};
 
 macro_rules! progress {
     ($context:tt, $progress:expr, $comment:expr) => {
@@ -60,7 +67,7 @@ impl Context {
     /// Configures this account with the currently set parameters.
     pub async fn configure(&self) -> Result<()> {
         ensure!(
-            self.scheduler.read().await.is_none(),
+            !self.scheduler.is_running().await,
             "cannot configure, already running"
         );
         ensure!(
@@ -88,7 +95,7 @@ impl Context {
                         self,
                         // We are using Anyhow's .context() and to show the
                         // inner error, too, we need the {:#}:
-                        &format!("{:#}", err),
+                        &format!("{err:#}"),
                     )
                     .await
                 )
@@ -157,7 +164,9 @@ async fn on_configure_completed(
                     Some(stock_str::aeap_explanation_and_link(context, &old_addr, &new_addr).await);
                 chat::add_device_msg(context, None, Some(&mut msg))
                     .await
-                    .ok_or_log_msg(context, "Cannot add AEAP explanation");
+                    .context("Cannot add AEAP explanation")
+                    .log_err(context)
+                    .ok();
             }
         }
     }
@@ -250,7 +259,7 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
                                         }
                                     }
                                 },
-                                strict_tls: Some(provider.strict_tls),
+                                strict_tls: Some(provider.opt.strict_tls),
                             })
                             .collect();
 
@@ -339,7 +348,7 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
         .collect();
     let provider_strict_tls = param
         .provider
-        .map_or(socks5_config.is_some(), |provider| provider.strict_tls);
+        .map_or(socks5_config.is_some(), |provider| provider.opt.strict_tls);
 
     let smtp_config_task = task::spawn(async move {
         let mut smtp_configured = false;
@@ -470,7 +479,9 @@ async fn configure(ctx: &Context, param: &mut LoginParam) -> Result<()> {
 
     ctx.set_config_bool(Config::FetchedExistingMsgs, false)
         .await?;
-    ctx.interrupt_inbox(InterruptInfo::new(false)).await;
+    ctx.scheduler
+        .interrupt_inbox(InterruptInfo::new(false))
+        .await;
 
     progress!(ctx, 940);
     update_device_chats_handle.await??;
@@ -493,8 +504,7 @@ async fn get_autoconfig(
     if let Ok(res) = moz_autoconfigure(
         ctx,
         &format!(
-            "https://autoconfig.{}/mail/config-v1.1.xml?emailaddress={}",
-            param_domain, param_addr_urlencoded
+            "https://autoconfig.{param_domain}/mail/config-v1.1.xml?emailaddress={param_addr_urlencoded}"
         ),
         param,
     )
@@ -565,13 +575,18 @@ async fn try_imap_one_param(
     provider_strict_tls: bool,
 ) -> Result<Imap, ConfigurationError> {
     let inf = format!(
-        "imap: {}@{}:{} security={} certificate_checks={} oauth2={}",
+        "imap: {}@{}:{} security={} certificate_checks={} oauth2={} socks5_config={}",
         param.user,
         param.server,
         param.port,
         param.security,
         param.certificate_checks,
-        param.oauth2
+        param.oauth2,
+        if let Some(socks5_config) = socks5_config {
+            socks5_config.to_string()
+        } else {
+            "None".to_string()
+        }
     );
     info!(context, "Trying: {}", inf);
 
@@ -582,7 +597,7 @@ async fn try_imap_one_param(
             info!(context, "failure: {:#}", err);
             return Err(ConfigurationError {
                 config: inf,
-                msg: format!("{:#}", err),
+                msg: format!("{err:#}"),
             });
         }
         Ok(imap) => imap,
@@ -593,7 +608,7 @@ async fn try_imap_one_param(
             info!(context, "failure: {:#}", err);
             Err(ConfigurationError {
                 config: inf,
-                msg: format!("{:#}", err),
+                msg: format!("{err:#}"),
             })
         }
         Ok(()) => {
@@ -634,7 +649,7 @@ async fn try_smtp_one_param(
         info!(context, "failure: {}", err);
         Err(ConfigurationError {
             config: inf,
-            msg: format!("{:#}", err),
+            msg: format!("{err:#}"),
         })
     } else {
         info!(context, "success: {}", inf);
@@ -643,10 +658,14 @@ async fn try_smtp_one_param(
     }
 }
 
+/// Failure to connect and login with email client configuration.
 #[derive(Debug, thiserror::Error)]
 #[error("Trying {config}…\nError: {msg}")]
 pub struct ConfigurationError {
+    /// Tried configuration description.
     config: String,
+
+    /// Error message.
     msg: String,
 }
 
@@ -661,6 +680,7 @@ async fn nicer_configuration_error(context: &Context, errors: Vec<ConfigurationE
 
     if errors.iter().all(|e| {
         e.msg.to_lowercase().contains("could not resolve")
+            || e.msg.to_lowercase().contains("no dns resolution results")
             || e.msg
                 .to_lowercase()
                 .contains("temporary failure in name resolution")

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{ensure, Context as _, Result};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use crate::context::Context;
@@ -17,6 +18,7 @@ use crate::stock_str::StockStrings;
 pub struct Accounts {
     dir: PathBuf,
     config: Config,
+    /// Map from account ID to the account.
     accounts: BTreeMap<u32, Context>,
 
     /// Event channel to emit account manager errors.
@@ -77,12 +79,12 @@ impl Accounts {
         })
     }
 
-    /// Get an account by its `id`:
+    /// Returns an account by its `id`:
     pub fn get_account(&self, id: u32) -> Option<Context> {
         self.accounts.get(&id).cloned()
     }
 
-    /// Get the currently selected account.
+    /// Returns the currently selected account.
     pub fn get_selected_account(&self) -> Option<Context> {
         let id = self.config.get_selected_account();
         self.accounts.get(&id).cloned()
@@ -96,14 +98,14 @@ impl Accounts {
         }
     }
 
-    /// Select the given account.
+    /// Selects the given account.
     pub async fn select_account(&mut self, id: u32) -> Result<()> {
         self.config.select_account(id).await?;
 
         Ok(())
     }
 
-    /// Add a new account and opens it.
+    /// Adds a new account and opens it.
     ///
     /// Returns account ID.
     pub async fn add_account(&mut self) -> Result<u32> {
@@ -138,46 +140,30 @@ impl Accounts {
         Ok(account_config.id)
     }
 
-    /// Remove an account.
+    /// Removes an account.
     pub async fn remove_account(&mut self, id: u32) -> Result<()> {
         let ctx = self
             .accounts
             .remove(&id)
-            .with_context(|| format!("no account with id {}", id))?;
+            .with_context(|| format!("no account with id {id}"))?;
         ctx.stop_io().await;
         drop(ctx);
 
         if let Some(cfg) = self.config.get_account(id) {
             let account_path = self.dir.join(cfg.dir);
 
-            // Spend up to 1 minute trying to remove the files.
-            // Files may remain locked up to 30 seconds due to r2d2 bug:
-            // https://github.com/sfackler/r2d2/issues/99
-            let mut counter = 0;
-            loop {
-                counter += 1;
-
-                if let Err(err) = fs::remove_dir_all(&account_path)
-                    .await
-                    .context("failed to remove account data")
-                {
-                    if counter > 60 {
-                        return Err(err);
-                    }
-
-                    // Wait 1 second and try again.
-                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-                } else {
-                    break;
-                }
-            }
+            fs::remove_dir_all(&account_path)
+                .await
+                .context("failed to remove account data")?;
         }
         self.config.remove_account(id).await?;
 
         Ok(())
     }
 
-    /// Migrate an existing account into this structure.
+    /// Migrates an existing account into this structure.
+    ///
+    /// Returns the ID of new account.
     pub async fn migrate_account(&mut self, dbfile: PathBuf) -> Result<u32> {
         let blobdir = Context::derive_blobdir(&dbfile);
         let walfile = Context::derive_walfile(&dbfile);
@@ -229,11 +215,10 @@ impl Accounts {
                 Ok(account_config.id)
             }
             Err(err) => {
-                // remove temp account
-                fs::remove_dir_all(std::path::PathBuf::from(&account_config.dir))
+                let account_path = std::path::PathBuf::from(&account_config.dir);
+                fs::remove_dir_all(&account_path)
                     .await
                     .context("failed to remove account data")?;
-
                 self.config.remove_account(account_config.id).await?;
 
                 // set selection back
@@ -279,7 +264,7 @@ impl Accounts {
     pub async fn stop_io(&self) {
         // Sending an event here wakes up event loop even
         // if there are no accounts.
-        info!(self, "Stopping IO for all accounts");
+        info!(self, "Stopping IO for all accounts.");
         for account in self.accounts.values() {
             account.stop_io().await;
         }
@@ -288,14 +273,14 @@ impl Accounts {
     /// Notifies all accounts that the network may have become available.
     pub async fn maybe_network(&self) {
         for account in self.accounts.values() {
-            account.maybe_network().await;
+            account.scheduler.maybe_network().await;
         }
     }
 
     /// Notifies all accounts that the network connection may have been lost.
     pub async fn maybe_network_lost(&self) {
         for account in self.accounts.values() {
-            account.maybe_network_lost().await;
+            account.scheduler.maybe_network_lost(account).await;
         }
     }
 
@@ -318,7 +303,7 @@ pub const DB_NAME: &str = "dc.db";
 
 /// Account manager configuration file.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Config {
+struct Config {
     file: PathBuf,
     inner: InnerConfig,
 }
@@ -342,10 +327,8 @@ impl Config {
             selected_account: 0,
             next_id: 1,
         };
-        let cfg = Config {
-            file: dir.join(CONFIG_NAME),
-            inner,
-        };
+        let file = dir.join(CONFIG_NAME);
+        let mut cfg = Self { file, inner };
 
         cfg.sync().await?;
 
@@ -353,27 +336,49 @@ impl Config {
     }
 
     /// Sync the inmemory representation to disk.
-    async fn sync(&self) -> Result<()> {
-        fs::write(&self.file, toml::to_string_pretty(&self.inner)?)
+    /// Takes a mutable reference because the saved file is a part of the `Config` state. This
+    /// protects from parallel calls resulting to a wrong file contents.
+    async fn sync(&mut self) -> Result<()> {
+        let tmp_path = self.file.with_extension("toml.tmp");
+        let mut file = fs::File::create(&tmp_path)
             .await
-            .context("failed to write config")
+            .context("failed to create a tmp config")?;
+        file.write_all(toml::to_string_pretty(&self.inner)?.as_bytes())
+            .await
+            .context("failed to write a tmp config")?;
+        file.sync_data()
+            .await
+            .context("failed to sync a tmp config")?;
+        drop(file);
+        fs::rename(&tmp_path, &self.file)
+            .await
+            .context("failed to rename config")?;
+        Ok(())
     }
 
     /// Read a configuration from the given file into memory.
     pub async fn from_file(file: PathBuf) -> Result<Self> {
         let dir = file.parent().context("can't get config file directory")?;
         let bytes = fs::read(&file).await.context("failed to read file")?;
-        let mut inner: InnerConfig = toml::from_slice(&bytes).context("failed to parse config")?;
+        let s = std::str::from_utf8(&bytes)?;
+        let mut inner: InnerConfig = toml::from_str(s).context("failed to parse config")?;
 
         // Previous versions of the core stored absolute paths in account config.
         // Convert them to relative paths.
+        let mut modified = false;
         for account in &mut inner.accounts {
             if let Ok(new_dir) = account.dir.strip_prefix(dir) {
                 account.dir = new_dir.to_path_buf();
+                modified = true;
             }
         }
 
-        Ok(Config { file, inner })
+        let mut config = Self { file, inner };
+        if modified {
+            config.sync().await?;
+        }
+
+        Ok(config)
     }
 
     /// Loads all accounts defined in the configuration file.
@@ -436,7 +441,7 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Removes an existing acccount entirely.
+    /// Removes an existing account entirely.
     pub async fn remove_account(&mut self, id: u32) -> Result<()> {
         {
             if let Some(idx) = self.inner.accounts.iter().position(|e| e.id == id) {
@@ -485,15 +490,18 @@ impl Config {
 struct AccountConfig {
     /// Unique id.
     pub id: u32,
+
     /// Root directory for all data for this account.
     ///
     /// The path is relative to the account manager directory.
     pub dir: std::path::PathBuf,
+
+    /// Universally unique account identifier.
     pub uuid: Uuid,
 }
 
 impl AccountConfig {
-    /// Get the canoncial dbfile name for this configuration.
+    /// Get the canonical dbfile name for this configuration.
     pub fn dbfile(&self, accounts_dir: &Path) -> std::path::PathBuf {
         accounts_dir.join(&self.dir).join(DB_NAME)
     }
@@ -502,7 +510,6 @@ impl AccountConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::stock_str::{self, StockMessage};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -510,17 +517,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p: PathBuf = dir.path().join("accounts1");
 
-        let mut accounts1 = Accounts::new(p.clone()).await.unwrap();
-        accounts1.add_account().await.unwrap();
+        {
+            let mut accounts = Accounts::new(p.clone()).await.unwrap();
+            accounts.add_account().await.unwrap();
 
-        let accounts2 = Accounts::open(p).await.unwrap();
+            assert_eq!(accounts.accounts.len(), 1);
+            assert_eq!(accounts.config.get_selected_account(), 1);
+        }
+        {
+            let accounts = Accounts::open(p).await.unwrap();
 
-        assert_eq!(accounts1.accounts.len(), 1);
-        assert_eq!(accounts1.config.get_selected_account(), 1);
-
-        assert_eq!(accounts1.dir, accounts2.dir);
-        assert_eq!(accounts1.config, accounts2.config,);
-        assert_eq!(accounts1.accounts.len(), accounts2.accounts.len());
+            assert_eq!(accounts.accounts.len(), 1);
+            assert_eq!(accounts.config.get_selected_account(), 1);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -4,15 +4,18 @@ use std::fmt;
 use std::pin::Pin;
 use std::time::Duration;
 
-use crate::net::connect_tcp;
 use anyhow::Result;
-pub use async_smtp::ServerAddress;
-use tokio::net::{self, TcpStream};
+use fast_socks5::client::{Config, Socks5Stream};
+use fast_socks5::util::target_addr::ToTargetAddr;
+use fast_socks5::AuthenticationMethod;
+use fast_socks5::Socks5Command;
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+use tokio::net::TcpStream;
 use tokio_io_timeout::TimeoutStream;
 
 use crate::context::Context;
-use fast_socks5::client::{Config, Socks5Stream};
-use fast_socks5::AuthenticationMethod;
+use crate::net::connect_tcp;
+use crate::sql::Sql;
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct Socks5Config {
@@ -23,9 +26,7 @@ pub struct Socks5Config {
 
 impl Socks5Config {
     /// Reads SOCKS5 configuration from the database.
-    pub async fn from_database(context: &Context) -> Result<Option<Self>> {
-        let sql = &context.sql;
-
+    pub async fn from_database(sql: &Sql) -> Result<Option<Self>> {
         let enabled = sql.get_raw_config_bool("socks5_enabled").await?;
         if enabled {
             let host = sql.get_raw_config("socks5_host").await?.unwrap_or_default();
@@ -54,12 +55,32 @@ impl Socks5Config {
         }
     }
 
+    /// Converts SOCKS5 configuration into URL.
+    pub fn to_url(&self) -> String {
+        // `socks5h` means that hostname is resolved into address by the proxy
+        // and DNS requests should not leak.
+        let mut url = "socks5h://".to_string();
+        if let Some((username, password)) = &self.user_password {
+            let username_urlencoded = utf8_percent_encode(username, NON_ALPHANUMERIC).to_string();
+            let password_urlencoded = utf8_percent_encode(password, NON_ALPHANUMERIC).to_string();
+            url += &format!("{username_urlencoded}:{password_urlencoded}@");
+        }
+        url += &format!("{}:{}", self.host, self.port);
+        url
+    }
+
+    /// If `load_dns_cache` is true, loads cached DNS resolution results.
+    /// Use this only if the connection is going to be protected with TLS checks.
     pub async fn connect(
         &self,
-        target_addr: impl net::ToSocketAddrs,
+        context: &Context,
+        target_host: &str,
+        target_port: u16,
         timeout_val: Duration,
+        load_dns_cache: bool,
     ) -> Result<Socks5Stream<Pin<Box<TimeoutStream<TcpStream>>>>> {
-        let tcp_stream = connect_tcp(target_addr, timeout_val).await?;
+        let tcp_stream =
+            connect_tcp(context, &self.host, self.port, timeout_val, load_dns_cache).await?;
 
         let authentication_method = if let Some((username, password)) = self.user_password.as_ref()
         {
@@ -70,18 +91,14 @@ impl Socks5Config {
         } else {
             None
         };
-        let socks_stream =
+        let mut socks_stream =
             Socks5Stream::use_stream(tcp_stream, authentication_method, Config::default()).await?;
+        let target_addr = (target_host, target_port).to_target_addr()?;
+        socks_stream
+            .request(Socks5Command::TCPConnect, target_addr)
+            .await?;
 
         Ok(socks_stream)
-    }
-
-    pub fn to_async_smtp_socks5_config(&self) -> async_smtp::smtp::Socks5Config {
-        async_smtp::smtp::Socks5Config {
-            host: self.host.clone(),
-            port: self.port,
-            user_password: self.user_password.clone(),
-        }
     }
 }
 
@@ -98,5 +115,37 @@ impl fmt::Display for Socks5Config {
                 "user: None".to_string()
             }
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_socks5h_url() {
+        let config = Socks5Config {
+            host: "127.0.0.1".to_string(),
+            port: 9050,
+            user_password: None,
+        };
+        assert_eq!(config.to_url(), "socks5h://127.0.0.1:9050");
+
+        let config = Socks5Config {
+            host: "example.org".to_string(),
+            port: 1080,
+            user_password: Some(("root".to_string(), "toor".to_string())),
+        };
+        assert_eq!(config.to_url(), "socks5h://root:toor@example.org:1080");
+
+        let config = Socks5Config {
+            host: "example.org".to_string(),
+            port: 1080,
+            user_password: Some(("root".to_string(), "foo/?\\@".to_string())),
+        };
+        assert_eq!(
+            config.to_url(),
+            "socks5h://root:foo%2F%3F%5C%40@example.org:1080"
+        );
     }
 }
